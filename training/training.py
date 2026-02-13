@@ -25,7 +25,7 @@ import multiprocessing as mp
 from concurrent.futures import ProcessPoolExecutor, wait, FIRST_COMPLETED, as_completed
 import esm as esmlib
 from utils import worker_init_fn, get_pdbs, loader_pdb, build_training_clusters, PDB_dataset, StructureDataset, StructureLoader, StructureSampler
-from model_utils import featurize, loss_smoothed, nlcpl, structure_loss, loss_nll, potts_singlesite_loss, get_std_opt, ProteinMPNN
+from model_utils import featurize, loss_smoothed, nlcpl, structure_loss, loss_nll, potts_singlesite_loss, get_std_opt, ProteinMPNN, ESMCContrastiveLoss
 
 class AverageMeter:
     """Computes and stores the average and current value efficiently.
@@ -51,6 +51,61 @@ class AverageMeter:
         if self._iters % self.update_every == 0:
             self.avg = self.sum / self.count if self.count > 0 else 0
 
+
+
+def load_embedding_lookup(path):
+    if not path:
+        return None
+    with open(path, 'rb') as f:
+        data = pickle.load(f)
+    if not isinstance(data, dict):
+        raise ValueError(f"Expected dict in --esmc_embedding_lookup, got {type(data)}")
+    return data
+
+
+def make_aa_embedding_table(embedding_lookup):
+    if embedding_lookup is None:
+        return None
+    if '__aa_embedding_table__' in embedding_lookup:
+        table = torch.as_tensor(embedding_lookup['__aa_embedding_table__'], dtype=torch.float32)
+        if table.dim() != 2:
+            raise ValueError('AA embedding table must be rank-2 [vocab, dim].')
+        return table
+    return None
+
+
+def load_esmc_cache(embeddings_dir, lengths_json):
+    if (not embeddings_dir) or (not lengths_json):
+        return None, None
+    with open(lengths_json, 'r') as f:
+        lengths_raw = json.load(f)
+    length_to_proteins = {int(k): v for k, v in lengths_raw.items()}
+    proteins = sorted({p for plist in length_to_proteins.values() for p in plist})
+
+    def _extract_npz_array(npz_obj, keys, fallback_index=None):
+        for k in keys:
+            if k in npz_obj.files:
+                return npz_obj[k]
+        if fallback_index is not None and len(npz_obj.files) > fallback_index:
+            return npz_obj[npz_obj.files[fallback_index]]
+        return None
+
+    cache = {}
+    for prot in proteins:
+        npz_path = os.path.join(embeddings_dir, f'embeddings_{prot}.npz')
+        if not os.path.exists(npz_path):
+            continue
+        data = np.load(npz_path)
+        msa = _extract_npz_array(data, ['msa', 'msa_embeddings', 'arr_0'], fallback_index=0)
+        rnd = _extract_npz_array(data, ['random', 'rand', 'random_embeddings', 'arr_1'], fallback_index=1)
+        if msa is None or rnd is None:
+            continue
+        if msa.ndim == 3:
+            msa = msa.mean(axis=1)
+        if rnd.ndim == 3:
+            rnd = rnd.mean(axis=1)
+        cache[prot] = {'msa': msa.astype(np.float32), 'random': rnd.astype(np.float32)}
+    return cache, length_to_proteins
 def load_pickle_stream(path):
     with open(path, "rb") as f:
         while True:
@@ -332,6 +387,30 @@ def main(args):
     if PATH and args.load_optimizer:
         optimizer.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
     print('setup optimizer')
+
+    # Optional ESM-C contrastive objective.
+    esmc_contrastive_loss = None
+    esmc_cache, esmc_length_to_proteins = None, None
+    if args.esmc_contrastive_weight > 0.0:
+        esmc_cache, esmc_length_to_proteins = load_esmc_cache(args.esmc_embeddings_dir, args.esmc_lengths_json)
+        embedding_lookup = load_embedding_lookup(args.esmc_embedding_lookup)
+        aa_embedding_table = make_aa_embedding_table(embedding_lookup)
+        if embedding_lookup is None or aa_embedding_table is None:
+            raise ValueError(
+                'ESM-C contrastive loss requires --esmc_embedding_lookup with keys '
+                "'__aa_embedding_table__' and per-protein {'msa','random'} embeddings."
+            )
+        esmc_contrastive_loss = ESMCContrastiveLoss(
+            aa_embedding_table=aa_embedding_table,
+            embedding_lookup=embedding_lookup,
+            temperature=args.esmc_temperature,
+            gumbel_tau=args.esmc_gumbel_tau,
+            num_random_negatives=args.esmc_num_random_negatives,
+            num_real_negatives_max=args.esmc_num_real_negatives_max,
+            real_neg_warmup_epochs=args.esmc_real_neg_warmup_epochs,
+            require_same_length_real_negatives=False,
+        ).to(device)
+
     kwargs = {}
     kwargs['num_workers'] = args.num_workers
     # kwargs['multiprocessing_context'] = 'spawn'
@@ -383,11 +462,11 @@ def main(args):
     # loader_train = StructureLoader(dataset_train, batch_size=args.batch_size)
     train_batch_sampler = StructureSampler(dataset_train, batch_size=args.batch_size, device=device, flex_type=args.noise_type, augment_eps=args.backbone_noise, replicate=args.replicate,
                                             esm=esm, batch_converter=batch_converter, esm_embed_layer=esm_embed_layer, esm_embed_dim=esm_embed_dim, one_hot=one_hot,
-                                            openfold_backbone=args.struct_predict, msa_seqs=args.msa_seqs, msa_batch_size=args.msa_batch_size)
+                                            openfold_backbone=args.struct_predict, msa_seqs=args.msa_seqs, msa_batch_size=args.msa_batch_size, esmc_cache=esmc_cache, esmc_length_to_proteins=esmc_length_to_proteins, esmc_num_real_negatives_max=args.esmc_num_real_negatives_max, esmc_real_neg_warmup_epochs=args.esmc_real_neg_warmup_epochs)
     loader_train = DataLoader(dataset_train, batch_sampler=train_batch_sampler, collate_fn=train_batch_sampler.package, pin_memory=True, **kwargs)
     # loader_valid = StructureLoader(dataset_valid, batch_size=args.batch_size)
     valid_batch_sampler = StructureSampler(dataset_valid, batch_size=args.batch_size, device=device, esm=esm, batch_converter=batch_converter, esm_embed_layer=esm_embed_layer,
-                                            esm_embed_dim=esm_embed_dim, one_hot=one_hot, openfold_backbone=args.struct_predict, msa_seqs=args.msa_seqs, msa_batch_size=args.msa_batch_size)
+                                            esm_embed_dim=esm_embed_dim, one_hot=one_hot, openfold_backbone=args.struct_predict, msa_seqs=args.msa_seqs, msa_batch_size=args.msa_batch_size, esmc_cache=esmc_cache, esmc_length_to_proteins=esmc_length_to_proteins, esmc_num_real_negatives_max=args.esmc_num_real_negatives_max, esmc_real_neg_warmup_epochs=args.esmc_real_neg_warmup_epochs)
     loader_valid = DataLoader(dataset_valid, batch_sampler=valid_batch_sampler, collate_fn=valid_batch_sampler.package, pin_memory=True, **kwargs)
     reload_c = 0 
     best_val_loss = np.inf
@@ -406,6 +485,7 @@ def main(args):
         train_sum, train_weights = 0., 0.
         nlcpl_train_sum = 0.
         struct_loss_train_sum = 0.
+        esmc_contrastive_train_sum = 0.
         train_acc = 0.
         
         if e % args.reload_data_every_n_epochs == 0:
@@ -415,11 +495,11 @@ def main(args):
                 
                 dataset_train = StructureDataset(pdb_dict_train, truncate=None, max_length=args.max_protein_length)
                 train_batch_sampler = StructureSampler(dataset_train, batch_size=args.batch_size, device=device, flex_type=args.noise_type, augment_eps=args.backbone_noise, replicate=args.replicate, esm=esm, batch_converter=batch_converter,
-                                                        esm_embed_layer=esm_embed_layer, esm_embed_dim=esm_embed_dim, one_hot=one_hot, openfold_backbone=args.struct_predict, msa_seqs=args.msa_seqs, msa_batch_size=args.msa_batch_size)
+                                                        esm_embed_layer=esm_embed_layer, esm_embed_dim=esm_embed_dim, one_hot=one_hot, openfold_backbone=args.struct_predict, msa_seqs=args.msa_seqs, msa_batch_size=args.msa_batch_size, esmc_cache=esmc_cache, esmc_length_to_proteins=esmc_length_to_proteins, esmc_num_real_negatives_max=args.esmc_num_real_negatives_max, esmc_real_neg_warmup_epochs=args.esmc_real_neg_warmup_epochs)
                 loader_train = DataLoader(dataset_train, batch_sampler=train_batch_sampler, collate_fn=train_batch_sampler.package, pin_memory=True, **kwargs)
                 dataset_valid = StructureDataset(pdb_dict_valid, truncate=None, max_length=args.max_protein_length)
                 valid_batch_sampler = StructureSampler(dataset_valid, batch_size=args.batch_size, device=device, esm=esm, batch_converter=batch_converter, esm_embed_layer=esm_embed_layer, esm_embed_dim=esm_embed_dim, one_hot=one_hot,
-                                                        openfold_backbone=args.struct_predict, msa_seqs=args.msa_seqs, msa_batch_size=args.msa_batch_size)
+                                                        openfold_backbone=args.struct_predict, msa_seqs=args.msa_seqs, msa_batch_size=args.msa_batch_size, esmc_cache=esmc_cache, esmc_length_to_proteins=esmc_length_to_proteins, esmc_num_real_negatives_max=args.esmc_num_real_negatives_max, esmc_real_neg_warmup_epochs=args.esmc_real_neg_warmup_epochs)
                 loader_valid = DataLoader(dataset_valid, batch_sampler=valid_batch_sampler, collate_fn=valid_batch_sampler.package, pin_memory=True, **kwargs)
 
             reload_c += 1
@@ -427,7 +507,7 @@ def main(args):
         valid_batch_sampler._set_epoch(e)
         pbar = tqdm(total=len(loader_train), desc=f"Epoch {e+1} [train]", unit="batch", miniters=100)
         for i_train_batch, batch in enumerate(loader_train):
-            X, S, S_true, mask, lengths, chain_M, residue_idx, mask_self, chain_encoding_all, all_chain_lens, backbone_4x4, names = batch
+            X, S, S_true, mask, lengths, chain_M, residue_idx, mask_self, chain_encoding_all, all_chain_lens, backbone_4x4, names, esmc_batch_lookup = batch
             if mask.sum(dim=1).min() == 0:
                 print(f"{names} have no valid positions")
                 print(mask.sum(dim=1))
@@ -441,6 +521,8 @@ def main(args):
             chain_encoding_all =chain_encoding_all.to(device=device)
             optimizer.zero_grad()
             mask_for_loss = mask*chain_M
+            esmc_loss = torch.zeros((), device=device)
+            esmc_count = 0
             
             if args.mixed_precision:
                 with torch.cuda.amp.autocast():
@@ -473,6 +555,9 @@ def main(args):
                                 if p.isnan().any():
                                     print(name)
                             print('done checking parameters')
+                if esmc_contrastive_loss is not None:
+                    esmc_loss, esmc_count = esmc_contrastive_loss(log_probs, mask_for_loss, names, e + 1, batch_embedding_lookup=esmc_batch_lookup)
+                    loss_av_smoothed += args.esmc_contrastive_weight * esmc_loss
                 if ((not args.etab_loss or not args.etab_loss_only) or nlcpl_count >= 0) and (not args.struct_predict or struct_success >= 0):
                     scaler.scale(loss_av_smoothed).backward()
                     
@@ -511,7 +596,10 @@ def main(args):
                                 if p.isnan().any():
                                     print(name)
                             print('done checking parameters')
-                if ((not args.etab_loss or not args.etab_loss_only) or nlcpl_count >= 0) and (not args.struct_predict or struct_success >= 0):
+                if esmc_contrastive_loss is not None:
+                    esmc_loss, esmc_count = esmc_contrastive_loss(log_probs, mask_for_loss, names, e + 1, batch_embedding_lookup=esmc_batch_lookup)
+                    loss_av_smoothed += args.esmc_contrastive_weight * esmc_loss
+                if args.etab_loss and nlcpl_count >= 0:
                     loss_av_smoothed.backward()
 
                 if args.gradient_norm > 0.0:
@@ -534,6 +622,8 @@ def main(args):
             # train_weights += torch.sum(mask_for_loss).cpu().data.numpy()
             if args.struct_predict:
                 struct_loss_train_sum += struct_loss.cpu().item()
+            if esmc_contrastive_loss is not None and esmc_count > 0:
+                esmc_contrastive_train_sum += esmc_loss.detach().cpu().item()
 
             total_step += 1
             # per-example statistics
@@ -564,9 +654,10 @@ def main(args):
             validation_sum, validation_weights = 0., 0.
             nlcpl_validation_sum = 0.
             struct_loss_val_sum = 0.
+            esmc_contrastive_val_sum = 0.
             validation_acc = 0.
             for i_val_batch, batch in enumerate(loader_valid):
-                X, S, S_true, mask, lengths, chain_M, residue_idx, mask_self, chain_encoding_all, all_chain_lens, backbone_4x4, names = batch
+                X, S, S_true, mask, lengths, chain_M, residue_idx, mask_self, chain_encoding_all, all_chain_lens, backbone_4x4, names, esmc_batch_lookup = batch
                 if mask.sum(dim=1).min() == 0:
                     print(f"{names} have no valid positions")
                     print(mask.sum(dim=1))
@@ -596,6 +687,10 @@ def main(args):
                         struct_loss_val_sum += struct_loss.cpu().item()
                     else:
                         struct_loss_val_sum += np.mean(struct_loss_val_sum)
+                if esmc_contrastive_loss is not None:
+                    esmc_loss, esmc_count = esmc_contrastive_loss(log_probs, mask_for_loss, names, e + 1, batch_embedding_lookup=esmc_batch_lookup)
+                    if esmc_count > 0:
+                        esmc_contrastive_val_sum += esmc_loss.detach().cpu().item()
                 
                 # validation_sum += torch.sum(loss * mask_for_loss).cpu().data.numpy()
                 # validation_acc += torch.sum(true_false * mask_for_loss).cpu().data.numpy()
@@ -646,7 +741,13 @@ def main(args):
             comb_loss += lambda_struct * val_struct_loss
             train_struct_loss = np.format_float_positional(np.float32(train_struct_loss), unique=False, precision=3)   
             val_struct_loss = np.format_float_positional(np.float32(val_struct_loss), unique=False, precision=3) 
-            lambda_struct_ = np.format_float_positional(np.float32(lambda_struct), unique=False, precision=3)
+        if esmc_contrastive_loss is not None:
+            train_esmc_loss = esmc_contrastive_train_sum / (i_train_batch + 1)
+            val_esmc_loss = esmc_contrastive_val_sum / (i_val_batch + 1)
+            train_comb_loss += args.esmc_contrastive_weight * train_esmc_loss
+            comb_loss += args.esmc_contrastive_weight * val_esmc_loss
+            train_esmc_loss = np.format_float_positional(np.float32(train_esmc_loss), unique=False, precision=3)
+            val_esmc_loss = np.format_float_positional(np.float32(val_esmc_loss), unique=False, precision=3)
                 
 
         t1 = time.time()
@@ -656,13 +757,17 @@ def main(args):
             if args.etab_loss or args.etab_loss_only:
                 f.write(f'\ttrain_nlcpl: {train_nlcpl}, valid_nlcpl: {validation_nlcpl}\n')
             if args.struct_predict:
-                f.write(f'\tlambda_struct: {lambda_struct_}, train_struct_loss: {train_struct_loss}, valid_struct_loss: {val_struct_loss}\n')
+                f.write(f'\ttrain_struct_loss: {train_struct_loss}, valid_struct_loss: {val_struct_loss}\n')
+            if esmc_contrastive_loss is not None:
+                f.write(f'\ttrain_esmc_contrastive_loss: {train_esmc_loss}, valid_esmc_contrastive_loss: {val_esmc_loss}\n')
 
         print(f'epoch: {e+1}, step: {total_step}, time: {dt}, train_loss: {train_comb_loss}, val_loss: {comb_loss}, best_val_loss: {best_val_loss}, train_perp: {train_perplexity_}, valid_prep: {validation_perplexity_}, train_acc: {train_accuracy_}, valid_acc: {validation_accuracy_}')
         if args.etab_loss or args.etab_loss_only:
             print(f'\ttrain_nlcpl: {train_nlcpl}, valid_nlcpl: {validation_nlcpl}')
         if args.struct_predict:
-            print(f'\tlambda_struct: {lambda_struct_}, train_struct_loss: {train_struct_loss}, valid_struct_loss: {val_struct_loss}\n')
+            print(f'\ttrain_struct_loss: {train_struct_loss}, valid_struct_loss: {val_struct_loss}\n')
+        if esmc_contrastive_loss is not None:
+            print(f'\ttrain_esmc_contrastive_loss: {train_esmc_loss}, valid_esmc_contrastive_loss: {val_esmc_loss}')
 
         if comb_loss < best_val_loss:
             checkpoint_filename_last = base_folder+'model_weights/epoch_best.pt'.format(e+1, total_step)
@@ -764,6 +869,16 @@ if __name__ == "__main__":
     argparser.add_argument("--insrt_thresh", type=float, default=0.2, help="insertion percent cutoff for msa sequences")
     argparser.add_argument("--remove_missing", type=int, default=1, help="whether to remove residues missing structure information")
     argparser.add_argument("--soluble_mpnn", type=str, default='', help='path for pdb_ids to exclude when training a soluble version of the model')
+    argparser.add_argument("--esmc_contrastive_weight", type=float, default=0.0, help="weight for ESM-C contrastive loss")
+    argparser.add_argument("--esmc_embedding_lookup", type=str, default='', help="pickle path containing ESM-C embeddings for msa/random sequences plus __aa_embedding_table__")
+    argparser.add_argument("--esmc_embeddings_dir", type=str, default='', help="directory containing embeddings_<prot>.npz files")
+    argparser.add_argument("--esmc_lengths_json", type=str, default='', help="json mapping lengths to proteins for real-negative sampling")
+    argparser.add_argument("--esmc_temperature", type=float, default=0.07, help="temperature for ESM-C contrastive loss")
+    argparser.add_argument("--esmc_gumbel_tau", type=float, default=1.0, help="Gumbel-Softmax temperature for differentiable sequence sampling")
+    argparser.add_argument("--esmc_num_random_negatives", type=int, default=16, help="number of random-sequence negatives per sample")
+    argparser.add_argument("--esmc_num_real_negatives_max", type=int, default=16, help="max number of real-sequence negatives from other MSAs")
+    argparser.add_argument("--esmc_real_neg_warmup_epochs", type=int, default=50, help="epochs to warm in real MSA negatives")
+    argparser.add_argument("--esmc_same_length_real_negatives", type=int, default=1, help="restrict real negatives from other MSAs to proteins with the same sequence length")
     argparser.add_argument("--num_data_workers", type=int, default=2, help="number of workers to use for processing data")
     args = argparser.parse_args()
 
@@ -783,6 +898,7 @@ if __name__ == "__main__":
     args.single_species_sample = args.single_species_sample == 1
     args.remove_missing = args.remove_missing == 1
     args.mixed_precision = args.mixed_precision == 1
+    args.esmc_same_length_real_negatives = args.esmc_same_length_real_negatives == 1
 
     print('starting')    
 

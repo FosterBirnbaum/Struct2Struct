@@ -66,7 +66,45 @@ def _esm_featurize(seq, chain_lens, esm, batch_converter, esm_embed_layer, devic
         embs = embs[mask]
     return embs
 
-def featurize(batch, device, augment_type, augment_eps, replicate, epoch, esm=None, batch_converter=None, esm_embed_dim=2560, esm_embed_layer=36, one_hot=False, return_esm=False, openfold_backbone=False, msa_seqs=False, msa_batch_size=10):
+def _pick_real_negative_name(name, target_length, length_to_proteins, esmc_cache):
+    same = [p for p in length_to_proteins.get(int(target_length), []) if p != name and p in esmc_cache]
+    if same:
+        return random.choice(same)
+    length_keys = sorted([int(k) for k in length_to_proteins.keys()], key=lambda x: abs(x - int(target_length)))
+    for L in length_keys:
+        candidates = [p for p in length_to_proteins.get(int(L), []) if p != name and p in esmc_cache]
+        if candidates:
+            return random.choice(candidates)
+    return None
+
+
+def build_esmc_batch_lookup(names, lengths, epoch, esmc_cache, length_to_proteins, num_real_negatives_max=16, real_neg_warmup_epochs=50):
+    if esmc_cache is None:
+        return None
+    out = {}
+    real_frac = min(float(epoch + 1) / float(max(real_neg_warmup_epochs, 1)), 1.0)
+    n_real = int(round(real_frac * num_real_negatives_max))
+    for name, length in zip(names, lengths):
+        info = esmc_cache.get(name)
+        if info is None:
+            continue
+        item = {'msa': info.get('msa'), 'random': info.get('random')}
+        real_list = []
+        for _ in range(n_real):
+            neg_name = _pick_real_negative_name(name, int(length), length_to_proteins, esmc_cache)
+            if neg_name is None:
+                continue
+            neg_rows = esmc_cache[neg_name].get('msa')
+            if neg_rows is not None and len(neg_rows) > 0:
+                pick = neg_rows[np.random.randint(0, len(neg_rows))]
+                real_list.append(pick)
+        if len(real_list) > 0:
+            item['real'] = np.stack(real_list, axis=0)
+        out[name] = item
+    return out
+
+
+def featurize(batch, device, augment_type, augment_eps, replicate, epoch, esm=None, batch_converter=None, esm_embed_dim=2560, esm_embed_layer=36, one_hot=False, return_esm=False, openfold_backbone=False, msa_seqs=False, msa_batch_size=10, esmc_cache=None, esmc_length_to_proteins=None, esmc_num_real_negatives_max=16, esmc_real_neg_warmup_epochs=50):
     alphabet = 'ACDEFGHIKLMNPQRSTVWYX-'
 
     if msa_seqs:
@@ -288,7 +326,8 @@ def featurize(batch, device, augment_type, augment_eps, replicate, epoch, esm=No
     else:
         backbone_4x4 = torch.Tensor([])
 
-    return (X, S, S_true, mask, lengths, chain_M, residue_idx, mask_self, chain_encoding_all, all_chain_lens, backbone_4x4, names)
+    esmc_batch_lookup = build_esmc_batch_lookup(names, lengths, epoch, esmc_cache, esmc_length_to_proteins, num_real_negatives_max=esmc_num_real_negatives_max, real_neg_warmup_epochs=esmc_real_neg_warmup_epochs)
+    return (X, S, S_true, mask, lengths, chain_M, residue_idx, mask_self, chain_encoding_all, all_chain_lens, backbone_4x4, names, esmc_batch_lookup)
 
 
 def loss_nll(S, log_probs, mask):
@@ -468,7 +507,153 @@ def potts_singlesite_loss(etab, E_idx, S, mask, vocab, weight=0.1, from_val=Fals
 
         loss = -(S_onehot * log_probs).sum(-1)
         loss_av = torch.sum(loss * full_mask) / 2000.0 #fixed 
-        return loss, loss_av
+    return loss, loss_av
+
+
+class ESMCContrastiveLoss(nn.Module):
+    """InfoNCE-style loss on sequence-level ESM-C embeddings.
+
+    The positive set is MSA embeddings for the current protein; negatives are
+    random-sequence embeddings for the same protein and (optionally) MSA
+    embeddings from other proteins.
+    """
+    def __init__(
+        self,
+        aa_embedding_table,
+        embedding_lookup,
+        temperature=0.07,
+        gumbel_tau=1.0,
+        num_random_negatives=16,
+        num_real_negatives_max=16,
+        real_neg_warmup_epochs=50,
+        require_same_length_real_negatives=True,
+    ):
+        super().__init__()
+        self.register_buffer("aa_embedding_table", aa_embedding_table.float())
+        self.embedding_lookup = embedding_lookup
+        self.temperature = temperature
+        self.gumbel_tau = gumbel_tau
+        self.num_random_negatives = num_random_negatives
+        self.num_real_negatives_max = num_real_negatives_max
+        self.real_neg_warmup_epochs = max(real_neg_warmup_epochs, 1)
+        self.require_same_length_real_negatives = require_same_length_real_negatives
+
+        # Global MSA pool used for "real" negatives from other proteins.
+        self._all_real = {}
+        self._seq_len_by_name = {}
+        self._all_real_by_length = {}
+        for name, vals in self.embedding_lookup.items():
+            if not isinstance(vals, dict):
+                continue
+            msa = vals.get('msa')
+            if msa is None:
+                continue
+            msa = torch.as_tensor(msa, dtype=torch.float32)
+            if msa.dim() == 1:
+                msa = msa.unsqueeze(0)
+            if msa.numel() == 0:
+                continue
+            self._all_real[name] = msa
+
+            seq_len = vals.get('length', vals.get('seq_len'))
+            if seq_len is not None:
+                seq_len = int(seq_len)
+                self._seq_len_by_name[name] = seq_len
+                self._all_real_by_length.setdefault(seq_len, []).append(name)
+
+        if self.require_same_length_real_negatives and len(self._all_real_by_length) == 0:
+            raise ValueError(
+                "No sequence lengths found in embedding_lookup for same-length real negatives. "
+                "Provide per-protein 'length' (or 'seq_len') metadata, or disable "
+                "--esmc_same_length_real_negatives."
+            )
+
+    def _sample_rows(self, rows, n_rows):
+        if rows is None:
+            return None
+        rows = torch.as_tensor(rows, dtype=torch.float32, device=self.aa_embedding_table.device)
+        if rows.dim() == 1:
+            rows = rows.unsqueeze(0)
+        if rows.shape[0] == 0 or n_rows <= 0:
+            return None
+        if rows.shape[0] <= n_rows:
+            return rows
+        idx = torch.randperm(rows.shape[0], device=rows.device)[:n_rows]
+        return rows[idx]
+
+
+    def _candidate_real_negative_names(self, name, seq_len):
+        if self.require_same_length_real_negatives:
+            if seq_len is None:
+                return []
+            names = self._all_real_by_length.get(int(seq_len), [])
+            return [n for n in names if n != name]
+        return [n for n in self._all_real.keys() if n != name]
+
+    def _real_negative_fraction(self, epoch):
+        return min(float(epoch) / float(self.real_neg_warmup_epochs), 1.0)
+
+    def forward(self, log_probs, mask, names, epoch, batch_embedding_lookup=None):
+        # Differentiable discrete sampling of predicted sequence.
+        aa_probs = F.gumbel_softmax(log_probs, tau=self.gumbel_tau, hard=False, dim=-1)
+        token_embs = aa_probs @ self.aa_embedding_table
+
+        seq_mask = mask.unsqueeze(-1)
+        denom = seq_mask.sum(dim=1).clamp_min(1.0)
+        pred_seq_embs = (token_embs * seq_mask).sum(dim=1) / denom
+        pred_seq_embs = F.normalize(pred_seq_embs, p=2, dim=-1)
+
+        real_neg_frac = self._real_negative_fraction(epoch)
+        n_real_negs = int(round(real_neg_frac * self.num_real_negatives_max))
+
+        losses = []
+        for i, name in enumerate(names):
+            sample_data = batch_embedding_lookup.get(name) if batch_embedding_lookup is not None else self.embedding_lookup.get(name)
+            seq_len = int(mask[i].sum().item()) if self.require_same_length_real_negatives else None
+            if sample_data is None:
+                continue
+
+            pos = self._sample_rows(sample_data.get('msa'), self.num_random_negatives)
+            rand_neg = self._sample_rows(sample_data.get('random'), self.num_random_negatives)
+            if pos is None or rand_neg is None:
+                continue
+
+            real_negs = []
+            precomputed_real = sample_data.get('real') if isinstance(sample_data, dict) else None
+            if precomputed_real is not None:
+                picked_real = self._sample_rows(precomputed_real, n_real_negs)
+                if picked_real is not None:
+                    real_negs.append(picked_real)
+            elif n_real_negs > 0:
+                other_names = self._candidate_real_negative_names(name, seq_len)
+                if len(other_names) > 0:
+                    chosen_names = random.choices(other_names, k=n_real_negs)
+                    for other_name in chosen_names:
+                        picked = self._sample_rows(self._all_real[other_name], 1)
+                        if picked is not None:
+                            real_negs.append(picked)
+
+            if len(real_negs) > 0:
+                real_negs = torch.cat(real_negs, dim=0)
+                negatives = torch.cat([rand_neg, real_negs], dim=0)
+            else:
+                negatives = rand_neg
+
+            pos = F.normalize(pos, p=2, dim=-1)
+            negatives = F.normalize(negatives, p=2, dim=-1)
+
+            all_cands = torch.cat([pos, negatives], dim=0)
+            sim = pred_seq_embs[i].unsqueeze(0) @ all_cands.transpose(0, 1)
+            sim = sim.squeeze(0) / self.temperature
+
+            # Multi-positive InfoNCE: maximize aggregate positive mass.
+            pos_logits = sim[:pos.shape[0]]
+            loss_i = -(torch.logsumexp(pos_logits, dim=0) - torch.logsumexp(sim, dim=0))
+            losses.append(loss_i)
+
+        if len(losses) == 0:
+            return torch.zeros((), device=log_probs.device), 0
+        return torch.stack(losses).mean(), len(losses)
 
 def structure_loss(frames, backbone_4x4, mask, num_frames=1):
     from openfold.utils.loss import backbone_loss_per_frame

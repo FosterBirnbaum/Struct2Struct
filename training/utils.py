@@ -61,7 +61,7 @@ class StructureDataset():
         return self.data[idx]
 
 class StructureSampler(Sampler):
-    def __init__(self, dataset, batch_size=100, device='cpu', flex_type="", augment_eps=0, replicate=1, esm=None, batch_converter=None, esm_embed_layer=36, esm_embed_dim=2560, one_hot=False, openfold_backbone=False, msa_seqs=False, msa_batch_size=1):
+    def __init__(self, dataset, batch_size=100, device='cpu', flex_type="", augment_eps=0, replicate=1, esm=None, batch_converter=None, esm_embed_layer=36, esm_embed_dim=2560, one_hot=False, openfold_backbone=False, msa_seqs=False, msa_batch_size=1, esmc_cache=None, esmc_length_to_proteins=None, esmc_num_real_negatives_max=16, esmc_real_neg_warmup_epochs=50):
         self.size = len(dataset)
         self.lengths = [len(dataset[i]['seq']) for i in range(self.size)]
         self.dataset = dataset
@@ -79,6 +79,10 @@ class StructureSampler(Sampler):
         self.openfold_backbone = openfold_backbone
         self.msa_seqs = msa_seqs
         self.msa_batch_size = msa_batch_size
+        self.esmc_cache = esmc_cache
+        self.esmc_length_to_proteins = esmc_length_to_proteins
+        self.esmc_num_real_negatives_max = esmc_num_real_negatives_max
+        self.esmc_real_neg_warmup_epochs = esmc_real_neg_warmup_epochs
         self._cluster()
 
     def _set_epoch(self, epoch):
@@ -108,7 +112,7 @@ class StructureSampler(Sampler):
         self.clusters = clusters
 
     def package(self, b_idx):
-        return featurize(b_idx, self.device, self.flex_type, self.augment_eps, self.replicate, self.epoch, self.esm, self.batch_converter, self.esm_embed_dim, self.esm_embed_layer, self.one_hot, openfold_backbone=self.openfold_backbone, msa_seqs=self.msa_seqs, msa_batch_size=self.msa_batch_size)
+        return featurize(b_idx, self.device, self.flex_type, self.augment_eps, self.replicate, self.epoch, self.esm, self.batch_converter, self.esm_embed_dim, self.esm_embed_layer, self.one_hot, openfold_backbone=self.openfold_backbone, msa_seqs=self.msa_seqs, msa_batch_size=self.msa_batch_size, esmc_cache=self.esmc_cache, esmc_length_to_proteins=self.esmc_length_to_proteins, esmc_num_real_negatives_max=self.esmc_num_real_negatives_max, esmc_real_neg_warmup_epochs=self.esmc_real_neg_warmup_epochs)
 
     def __len__(self):
         return len(self.clusters)
