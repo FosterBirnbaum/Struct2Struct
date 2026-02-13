@@ -470,10 +470,32 @@ def potts_singlesite_loss(etab, E_idx, S, mask, vocab, weight=0.1, from_val=Fals
         loss_av = torch.sum(loss * full_mask) / 2000.0 #fixed 
         return loss, loss_av
 
-def structure_loss(frames, backbone_4x4, mask):
+def structure_loss(frames, backbone_4x4, mask, num_frames=1):
     from openfold.utils.loss import backbone_loss_per_frame
-    loss, residue_loss = backbone_loss_per_frame(backbone_4x4, mask, traj=frames[-1])
-    residue_loss = residue_loss.squeeze(0)
+
+    if isinstance(frames, (list, tuple)):
+        frame_traj = list(frames)
+    elif isinstance(frames, torch.Tensor):
+        if frames.shape[0] <= 0:
+            return 0, None, -1
+        frame_traj = [frames[i] for i in range(frames.shape[0])]
+    else:
+        return 0, None, -1
+
+    if num_frames <= 0 or num_frames >= len(frame_traj):
+        frames_to_use = frame_traj
+    else:
+        frames_to_use = frame_traj[-num_frames:]
+
+    loss_vals = []
+    residue_loss_vals = []
+    for cur_frame in frames_to_use:
+        cur_loss, cur_residue_loss = backbone_loss_per_frame(backbone_4x4, mask, traj=cur_frame)
+        loss_vals.append(cur_loss)
+        residue_loss_vals.append(cur_residue_loss.squeeze(0))
+
+    loss = torch.stack(loss_vals).mean(dim=0)
+    residue_loss = torch.stack(residue_loss_vals).mean(dim=0)
 
     # with open('residue_loss.txt', 'w') as f:
     #     for r_loss in residue_loss.flatten().cpu().numpy():
