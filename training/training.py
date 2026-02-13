@@ -471,6 +471,11 @@ def main(args):
     reload_c = 0 
     best_val_loss = np.inf
     for e in range(args.num_epochs):
+        if args.struct_warmup_epochs > 0:
+            warmup_frac = min(1.0, float(e + 1) / float(args.struct_warmup_epochs))
+            lambda_struct = args.lambda_struct * warmup_frac
+        else:
+            lambda_struct = args.lambda_struct
         loss_meter = AverageMeter(update_every=100)
         acc_meter = AverageMeter(update_every=100)
 
@@ -539,8 +544,8 @@ def main(args):
                         _, loss_av_smoothed = potts_singlesite_loss(etab, E_idx, S_true, mask, vocab, from_val=False)
                     if args.struct_predict:
                         backbone_4x4 = backbone_4x4.to(device=device)
-                        struct_loss, _, struct_success = structure_loss(frames, backbone_4x4, mask)
-                        if struct_success >= 0: loss_av_smoothed += struct_loss
+                        struct_loss, _, struct_success = structure_loss(frames, backbone_4x4, mask, num_frames=args.struct_loss_num_frames)
+                        if struct_success >= 0: loss_av_smoothed += lambda_struct * struct_loss
                         else:
                             print(names)
                             print(log_probs.isnan().any(), etab.isnan().any())
@@ -580,8 +585,8 @@ def main(args):
                     _, loss_av_smoothed = potts_singlesite_loss(etab, E_idx, S_true, mask, vocab, from_val=False)
                 if args.struct_predict:
                         backbone_4x4 = backbone_4x4.to(device=device)
-                        struct_loss, _, struct_success = structure_loss(frames, backbone_4x4, mask)
-                        if struct_success >= 0: loss_av_smoothed += struct_loss
+                        struct_loss, _, struct_success = structure_loss(frames, backbone_4x4, mask, num_frames=args.struct_loss_num_frames)
+                        if struct_success >= 0: loss_av_smoothed += lambda_struct * struct_loss
                         else:
                             print(names)
                             print(log_probs.isnan().any(), etab.isnan().any())
@@ -677,7 +682,7 @@ def main(args):
                     loss, loss_av, true_false = potts_singlesite_loss(etab, E_idx, S_true, mask_for_loss, vocab, from_val=True)
                 if args.struct_predict:
                     backbone_4x4 = backbone_4x4.to(device=device)
-                    struct_loss, _, struct_success = structure_loss(frames, backbone_4x4, mask)
+                    struct_loss, _, struct_success = structure_loss(frames, backbone_4x4, mask, num_frames=args.struct_loss_num_frames)
                     if struct_success >= 0:
                         struct_loss_val_sum += struct_loss.cpu().item()
                     else:
@@ -732,8 +737,8 @@ def main(args):
         if args.struct_predict:
             train_struct_loss = struct_loss_train_sum / (i_train_batch + 1)
             val_struct_loss = struct_loss_val_sum / (i_val_batch + 1)
-            train_comb_loss += train_struct_loss
-            comb_loss += val_struct_loss
+            train_comb_loss += lambda_struct * train_struct_loss
+            comb_loss += lambda_struct * val_struct_loss
             train_struct_loss = np.format_float_positional(np.float32(train_struct_loss), unique=False, precision=3)   
             val_struct_loss = np.format_float_positional(np.float32(val_struct_loss), unique=False, precision=3) 
         if esmc_contrastive_loss is not None:
@@ -841,6 +846,9 @@ if __name__ == "__main__":
     argparser.add_argument("--seq_encoding", type=str, default="one_hot", help="Sequence encoding to use")
     argparser.add_argument("--num_workers", type=int, default=12, help="number of workers to use for data loading")
     argparser.add_argument("--struct_predict", type=int, default=0, help="whether to use end-to-end structure supervision")
+    argparser.add_argument("--lambda_struct", type=float, default=1.0, help="weight for structure loss term")
+    argparser.add_argument("--struct_warmup_epochs", type=int, default=0, help="linearly warm structure loss weight over this many epochs")
+    argparser.add_argument("--struct_loss_num_frames", type=int, default=1, help="number of most recent structure frames to include in structure loss; <=0 uses all")
     argparser.add_argument("--use_struct_weights", type=int, default=0, help="whether to use pre-trained weights for end-to-end structure supervision")
     argparser.add_argument("--multimer_structure_module", type=int, default=0, help="whether to use multimer model for end-to-end structure supervision")
     argparser.add_argument("--struct_predict_pairs", type=int, default=1, help="whether to use pairs for end-to-end structure supervision")
