@@ -25,7 +25,7 @@ import multiprocessing as mp
 from concurrent.futures import ProcessPoolExecutor, wait, FIRST_COMPLETED, as_completed
 import esm as esmlib
 from utils import worker_init_fn, get_pdbs, loader_pdb, build_training_clusters, PDB_dataset, StructureDataset, StructureLoader, StructureSampler
-from model_utils import featurize, loss_smoothed, nlcpl, structure_loss, loss_nll, potts_singlesite_loss, get_std_opt, ProteinMPNN, ESMCContrastiveLoss
+from model_utils import featurize, loss_smoothed, nlcpl, structure_loss, loss_nll, potts_singlesite_loss, get_std_opt, ProteinMPNN, ESMCContrastiveLoss, PairformerEdgeAlignmentLoss
 
 class AverageMeter:
     """Computes and stores the average and current value efficiently.
@@ -391,6 +391,15 @@ def main(args):
     # Optional ESM-C contrastive objective.
     esmc_contrastive_loss = None
     esmc_cache, esmc_length_to_proteins = None, None
+    pairformer_edge_loss = None
+    if args.pairformer_loss_weight > 0.0:
+        pairformer_edge_loss = PairformerEdgeAlignmentLoss(
+            pred_dim=args.hidden_dim,
+            target_dim=128,
+            proj_dim=args.pairformer_projection_dim,
+            var_weight=args.pairformer_variance_weight,
+            var_target=args.pairformer_variance_target,
+        ).to(device)
     if args.esmc_contrastive_weight > 0.0:
         esmc_cache, esmc_length_to_proteins = load_esmc_cache(args.esmc_embeddings_dir, args.esmc_lengths_json)
         embedding_lookup = load_embedding_lookup(args.esmc_embedding_lookup)
@@ -462,11 +471,11 @@ def main(args):
     # loader_train = StructureLoader(dataset_train, batch_size=args.batch_size)
     train_batch_sampler = StructureSampler(dataset_train, batch_size=args.batch_size, device=device, flex_type=args.noise_type, augment_eps=args.backbone_noise, replicate=args.replicate,
                                             esm=esm, batch_converter=batch_converter, esm_embed_layer=esm_embed_layer, esm_embed_dim=esm_embed_dim, one_hot=one_hot,
-                                            openfold_backbone=args.struct_predict, msa_seqs=args.msa_seqs, msa_batch_size=args.msa_batch_size, esmc_cache=esmc_cache, esmc_length_to_proteins=esmc_length_to_proteins, esmc_num_real_negatives_max=args.esmc_num_real_negatives_max, esmc_real_neg_warmup_epochs=args.esmc_real_neg_warmup_epochs)
+                                            openfold_backbone=args.struct_predict, msa_seqs=args.msa_seqs, msa_batch_size=args.msa_batch_size, esmc_cache=esmc_cache, esmc_length_to_proteins=esmc_length_to_proteins, esmc_num_real_negatives_max=args.esmc_num_real_negatives_max, esmc_real_neg_warmup_epochs=args.esmc_real_neg_warmup_epochs, pairformer_embeddings_dir=args.pairformer_embeddings_dir)
     loader_train = DataLoader(dataset_train, batch_sampler=train_batch_sampler, collate_fn=train_batch_sampler.package, pin_memory=True, **kwargs)
     # loader_valid = StructureLoader(dataset_valid, batch_size=args.batch_size)
     valid_batch_sampler = StructureSampler(dataset_valid, batch_size=args.batch_size, device=device, esm=esm, batch_converter=batch_converter, esm_embed_layer=esm_embed_layer,
-                                            esm_embed_dim=esm_embed_dim, one_hot=one_hot, openfold_backbone=args.struct_predict, msa_seqs=args.msa_seqs, msa_batch_size=args.msa_batch_size, esmc_cache=esmc_cache, esmc_length_to_proteins=esmc_length_to_proteins, esmc_num_real_negatives_max=args.esmc_num_real_negatives_max, esmc_real_neg_warmup_epochs=args.esmc_real_neg_warmup_epochs)
+                                            esm_embed_dim=esm_embed_dim, one_hot=one_hot, openfold_backbone=args.struct_predict, msa_seqs=args.msa_seqs, msa_batch_size=args.msa_batch_size, esmc_cache=esmc_cache, esmc_length_to_proteins=esmc_length_to_proteins, esmc_num_real_negatives_max=args.esmc_num_real_negatives_max, esmc_real_neg_warmup_epochs=args.esmc_real_neg_warmup_epochs, pairformer_embeddings_dir=args.pairformer_embeddings_dir)
     loader_valid = DataLoader(dataset_valid, batch_sampler=valid_batch_sampler, collate_fn=valid_batch_sampler.package, pin_memory=True, **kwargs)
     reload_c = 0 
     best_val_loss = np.inf
@@ -486,6 +495,7 @@ def main(args):
         nlcpl_train_sum = 0.
         struct_loss_train_sum = 0.
         esmc_contrastive_train_sum = 0.
+        pairformer_train_sum = 0.
         train_acc = 0.
         
         if e % args.reload_data_every_n_epochs == 0:
@@ -495,11 +505,11 @@ def main(args):
                 
                 dataset_train = StructureDataset(pdb_dict_train, truncate=None, max_length=args.max_protein_length)
                 train_batch_sampler = StructureSampler(dataset_train, batch_size=args.batch_size, device=device, flex_type=args.noise_type, augment_eps=args.backbone_noise, replicate=args.replicate, esm=esm, batch_converter=batch_converter,
-                                                        esm_embed_layer=esm_embed_layer, esm_embed_dim=esm_embed_dim, one_hot=one_hot, openfold_backbone=args.struct_predict, msa_seqs=args.msa_seqs, msa_batch_size=args.msa_batch_size, esmc_cache=esmc_cache, esmc_length_to_proteins=esmc_length_to_proteins, esmc_num_real_negatives_max=args.esmc_num_real_negatives_max, esmc_real_neg_warmup_epochs=args.esmc_real_neg_warmup_epochs)
+                                                        esm_embed_layer=esm_embed_layer, esm_embed_dim=esm_embed_dim, one_hot=one_hot, openfold_backbone=args.struct_predict, msa_seqs=args.msa_seqs, msa_batch_size=args.msa_batch_size, esmc_cache=esmc_cache, esmc_length_to_proteins=esmc_length_to_proteins, esmc_num_real_negatives_max=args.esmc_num_real_negatives_max, esmc_real_neg_warmup_epochs=args.esmc_real_neg_warmup_epochs, pairformer_embeddings_dir=args.pairformer_embeddings_dir)
                 loader_train = DataLoader(dataset_train, batch_sampler=train_batch_sampler, collate_fn=train_batch_sampler.package, pin_memory=True, **kwargs)
                 dataset_valid = StructureDataset(pdb_dict_valid, truncate=None, max_length=args.max_protein_length)
                 valid_batch_sampler = StructureSampler(dataset_valid, batch_size=args.batch_size, device=device, esm=esm, batch_converter=batch_converter, esm_embed_layer=esm_embed_layer, esm_embed_dim=esm_embed_dim, one_hot=one_hot,
-                                                        openfold_backbone=args.struct_predict, msa_seqs=args.msa_seqs, msa_batch_size=args.msa_batch_size, esmc_cache=esmc_cache, esmc_length_to_proteins=esmc_length_to_proteins, esmc_num_real_negatives_max=args.esmc_num_real_negatives_max, esmc_real_neg_warmup_epochs=args.esmc_real_neg_warmup_epochs)
+                                                        openfold_backbone=args.struct_predict, msa_seqs=args.msa_seqs, msa_batch_size=args.msa_batch_size, esmc_cache=esmc_cache, esmc_length_to_proteins=esmc_length_to_proteins, esmc_num_real_negatives_max=args.esmc_num_real_negatives_max, esmc_real_neg_warmup_epochs=args.esmc_real_neg_warmup_epochs, pairformer_embeddings_dir=args.pairformer_embeddings_dir)
                 loader_valid = DataLoader(dataset_valid, batch_sampler=valid_batch_sampler, collate_fn=valid_batch_sampler.package, pin_memory=True, **kwargs)
 
             reload_c += 1
@@ -507,7 +517,7 @@ def main(args):
         valid_batch_sampler._set_epoch(e)
         pbar = tqdm(total=len(loader_train), desc=f"Epoch {e+1} [train]", unit="batch", miniters=100)
         for i_train_batch, batch in enumerate(loader_train):
-            X, S, S_true, mask, lengths, chain_M, residue_idx, mask_self, chain_encoding_all, all_chain_lens, backbone_4x4, names, esmc_batch_lookup = batch
+            X, S, S_true, mask, lengths, chain_M, residue_idx, mask_self, chain_encoding_all, all_chain_lens, backbone_4x4, names, esmc_batch_lookup, pairformer_z, pairformer_mask = batch
             if mask.sum(dim=1).min() == 0:
                 print(f"{names} have no valid positions")
                 print(mask.sum(dim=1))
@@ -519,14 +529,18 @@ def main(args):
             mask_self = mask_self.to(device=device)
             chain_M = chain_M.to(device=device)
             chain_encoding_all =chain_encoding_all.to(device=device)
+            pairformer_z = pairformer_z.to(device=device)
+            pairformer_mask = pairformer_mask.to(device=device)
             optimizer.zero_grad()
             mask_for_loss = mask*chain_M
             esmc_loss = torch.zeros((), device=device)
             esmc_count = 0
+            pairformer_loss = torch.zeros((), device=device)
+            pairformer_count = 0
             
             if args.mixed_precision:
                 with torch.cuda.amp.autocast():
-                    log_probs, etab, E_idx, frames, positions = model(X, S, mask, chain_M, residue_idx, chain_encoding_all, all_chain_lens, e, replicate=args.replicate)
+                    log_probs, etab, E_idx, h_E, frames, positions = model(X, S, mask, chain_M, residue_idx, chain_encoding_all, all_chain_lens, e, replicate=args.replicate)
                     _, loss_av_smoothed = loss_smoothed(S_true, log_probs, mask_for_loss, vocab, fixed_denom=args.fixed_denom)
                     if args.etab_loss:
                         nlcpl_loss, nlcpl_count = nlcpl(etab, E_idx, S_true, mask, fixed_denom=args.fixed_potts_denom)
@@ -558,6 +572,10 @@ def main(args):
                 if esmc_contrastive_loss is not None:
                     esmc_loss, esmc_count = esmc_contrastive_loss(log_probs, mask_for_loss, names, e + 1, batch_embedding_lookup=esmc_batch_lookup)
                     loss_av_smoothed += args.esmc_contrastive_weight * esmc_loss
+                if pairformer_edge_loss is not None:
+                    pairformer_loss, pairformer_count = pairformer_edge_loss(h_E, E_idx, pairformer_z, pairformer_mask, mask)
+                    if pairformer_count > 0:
+                        loss_av_smoothed += args.pairformer_loss_weight * pairformer_loss
                 if ((not args.etab_loss or not args.etab_loss_only) or nlcpl_count >= 0) and (not args.struct_predict or struct_success >= 0):
                     scaler.scale(loss_av_smoothed).backward()
                     
@@ -567,7 +585,7 @@ def main(args):
                 scaler.step(optimizer)
                 scaler.update()
             else:
-                log_probs, etab, E_idx, frames, positions = model(X, S, mask, chain_M, residue_idx, chain_encoding_all, all_chain_lens, e, replicate=args.replicate)
+                log_probs, etab, E_idx, h_E, frames, positions = model(X, S, mask, chain_M, residue_idx, chain_encoding_all, all_chain_lens, e, replicate=args.replicate)
                 _, loss_av_smoothed = loss_smoothed(S_true, log_probs, mask_for_loss, vocab, fixed_denom=args.fixed_denom)
                 if args.etab_loss:
                         nlcpl_loss, nlcpl_count = nlcpl(etab, E_idx, S_true, mask, fixed_denom=args.fixed_potts_denom)
@@ -599,6 +617,10 @@ def main(args):
                 if esmc_contrastive_loss is not None:
                     esmc_loss, esmc_count = esmc_contrastive_loss(log_probs, mask_for_loss, names, e + 1, batch_embedding_lookup=esmc_batch_lookup)
                     loss_av_smoothed += args.esmc_contrastive_weight * esmc_loss
+                if pairformer_edge_loss is not None:
+                    pairformer_loss, pairformer_count = pairformer_edge_loss(h_E, E_idx, pairformer_z, pairformer_mask, mask)
+                    if pairformer_count > 0:
+                        loss_av_smoothed += args.pairformer_loss_weight * pairformer_loss
                 if args.etab_loss and nlcpl_count >= 0:
                     loss_av_smoothed.backward()
 
@@ -624,6 +646,8 @@ def main(args):
                 struct_loss_train_sum += struct_loss.cpu().item()
             if esmc_contrastive_loss is not None and esmc_count > 0:
                 esmc_contrastive_train_sum += esmc_loss.detach().cpu().item()
+            if pairformer_edge_loss is not None and pairformer_count > 0:
+                pairformer_train_sum += pairformer_loss.detach().cpu().item()
 
             total_step += 1
             # per-example statistics
@@ -655,9 +679,10 @@ def main(args):
             nlcpl_validation_sum = 0.
             struct_loss_val_sum = 0.
             esmc_contrastive_val_sum = 0.
+            pairformer_val_sum = 0.
             validation_acc = 0.
             for i_val_batch, batch in enumerate(loader_valid):
-                X, S, S_true, mask, lengths, chain_M, residue_idx, mask_self, chain_encoding_all, all_chain_lens, backbone_4x4, names, esmc_batch_lookup = batch
+                X, S, S_true, mask, lengths, chain_M, residue_idx, mask_self, chain_encoding_all, all_chain_lens, backbone_4x4, names, esmc_batch_lookup, pairformer_z, pairformer_mask = batch
                 if mask.sum(dim=1).min() == 0:
                     print(f"{names} have no valid positions")
                     print(mask.sum(dim=1))
@@ -669,7 +694,9 @@ def main(args):
                 mask_self = mask_self.to(device=device)
                 chain_M = chain_M.to(device=device)
                 chain_encoding_all =chain_encoding_all.to(device=device)
-                log_probs, etab, E_idx, frames, positions = model(X, S, mask, chain_M, residue_idx, chain_encoding_all)
+                pairformer_z = pairformer_z.to(device=device)
+                pairformer_mask = pairformer_mask.to(device=device)
+                log_probs, etab, E_idx, h_E, frames, positions = model(X, S, mask, chain_M, residue_idx, chain_encoding_all, all_chain_lens, e, replicate=args.replicate)
                 mask_for_loss = mask*chain_M
                 loss, loss_av, true_false = loss_nll(S_true, log_probs, mask_for_loss)
                 if args.etab_loss or args.etab_loss_only:
@@ -691,6 +718,10 @@ def main(args):
                     esmc_loss, esmc_count = esmc_contrastive_loss(log_probs, mask_for_loss, names, e + 1, batch_embedding_lookup=esmc_batch_lookup)
                     if esmc_count > 0:
                         esmc_contrastive_val_sum += esmc_loss.detach().cpu().item()
+                if pairformer_edge_loss is not None:
+                    pairformer_loss, pairformer_count = pairformer_edge_loss(h_E, E_idx, pairformer_z, pairformer_mask, mask)
+                    if pairformer_count > 0:
+                        pairformer_val_sum += pairformer_loss.detach().cpu().item()
                 
                 # validation_sum += torch.sum(loss * mask_for_loss).cpu().data.numpy()
                 # validation_acc += torch.sum(true_false * mask_for_loss).cpu().data.numpy()
@@ -748,6 +779,13 @@ def main(args):
             comb_loss += args.esmc_contrastive_weight * val_esmc_loss
             train_esmc_loss = np.format_float_positional(np.float32(train_esmc_loss), unique=False, precision=3)
             val_esmc_loss = np.format_float_positional(np.float32(val_esmc_loss), unique=False, precision=3)
+        if pairformer_edge_loss is not None:
+            train_pairformer_loss = pairformer_train_sum / (i_train_batch + 1)
+            val_pairformer_loss = pairformer_val_sum / (i_val_batch + 1)
+            train_comb_loss += args.pairformer_loss_weight * train_pairformer_loss
+            comb_loss += args.pairformer_loss_weight * val_pairformer_loss
+            train_pairformer_loss = np.format_float_positional(np.float32(train_pairformer_loss), unique=False, precision=3)
+            val_pairformer_loss = np.format_float_positional(np.float32(val_pairformer_loss), unique=False, precision=3)
                 
 
         t1 = time.time()
@@ -758,6 +796,8 @@ def main(args):
                 f.write(f'\ttrain_nlcpl: {train_nlcpl}, valid_nlcpl: {validation_nlcpl}\n')
             if args.struct_predict:
                 f.write(f'\ttrain_struct_loss: {train_struct_loss}, valid_struct_loss: {val_struct_loss}\n')
+            if pairformer_edge_loss is not None:
+                f.write(f'\ttrain_pairformer_loss: {train_pairformer_loss}, valid_pairformer_loss: {val_pairformer_loss}\n')
             if esmc_contrastive_loss is not None:
                 f.write(f'\ttrain_esmc_contrastive_loss: {train_esmc_loss}, valid_esmc_contrastive_loss: {val_esmc_loss}\n')
 
@@ -879,6 +919,11 @@ if __name__ == "__main__":
     argparser.add_argument("--esmc_num_real_negatives_max", type=int, default=16, help="max number of real-sequence negatives from other MSAs")
     argparser.add_argument("--esmc_real_neg_warmup_epochs", type=int, default=50, help="epochs to warm in real MSA negatives")
     argparser.add_argument("--esmc_same_length_real_negatives", type=int, default=1, help="restrict real negatives from other MSAs to proteins with the same sequence length")
+    argparser.add_argument("--pairformer_embeddings_dir", type=str, default='', help="directory containing pairformer embeddings_<prot>.npz with key 'z'")
+    argparser.add_argument("--pairformer_loss_weight", type=float, default=0.0, help="weight for pairformer edge alignment loss")
+    argparser.add_argument("--pairformer_projection_dim", type=int, default=128, help="projection dimension for pairformer edge alignment")
+    argparser.add_argument("--pairformer_variance_weight", type=float, default=0.01, help="variance regularization weight for pairformer alignment")
+    argparser.add_argument("--pairformer_variance_target", type=float, default=1.0, help="target per-dimension std for pairformer variance regularization")
     argparser.add_argument("--num_data_workers", type=int, default=2, help="number of workers to use for processing data")
     args = argparser.parse_args()
 

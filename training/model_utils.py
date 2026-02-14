@@ -104,7 +104,39 @@ def build_esmc_batch_lookup(names, lengths, epoch, esmc_cache, length_to_protein
     return out
 
 
-def featurize(batch, device, augment_type, augment_eps, replicate, epoch, esm=None, batch_converter=None, esm_embed_dim=2560, esm_embed_layer=36, one_hot=False, return_esm=False, openfold_backbone=False, msa_seqs=False, msa_batch_size=10, esmc_cache=None, esmc_length_to_proteins=None, esmc_num_real_negatives_max=16, esmc_real_neg_warmup_epochs=50):
+def load_pairformer_batch_lookup(names, lengths, pairformer_embeddings_dir, emb_dim=128):
+    if not pairformer_embeddings_dir:
+        return None, None
+
+    pairformer_lookup = {}
+    missing = []
+    bad_shape = []
+    for name, length in zip(names, lengths):
+        npz_path = os.path.join(pairformer_embeddings_dir, f'embeddings_{name}.npz')
+        if not os.path.exists(npz_path):
+            missing.append(name)
+            continue
+        try:
+            obj = np.load(npz_path)
+            if 'z' not in obj.files:
+                bad_shape.append(name)
+                continue
+            z = obj['z']
+            if z.ndim != 3 or z.shape[0] != int(length) or z.shape[1] != int(length) or z.shape[2] != emb_dim:
+                bad_shape.append(name)
+                continue
+            pairformer_lookup[name] = z.astype(np.float32)
+        except Exception:
+            bad_shape.append(name)
+
+    if len(missing) > 0:
+        print(f"| pairformer missing embeddings for {len(missing)} proteins in batch (example: {missing[0]})")
+    if len(bad_shape) > 0:
+        print(f"| pairformer malformed embeddings for {len(bad_shape)} proteins in batch (example: {bad_shape[0]})")
+    return pairformer_lookup, emb_dim
+
+
+def featurize(batch, device, augment_type, augment_eps, replicate, epoch, esm=None, batch_converter=None, esm_embed_dim=2560, esm_embed_layer=36, one_hot=False, return_esm=False, openfold_backbone=False, msa_seqs=False, msa_batch_size=10, esmc_cache=None, esmc_length_to_proteins=None, esmc_num_real_negatives_max=16, esmc_real_neg_warmup_epochs=50, pairformer_embeddings_dir=""):
     alphabet = 'ACDEFGHIKLMNPQRSTVWYX-'
 
     if msa_seqs:
@@ -327,7 +359,23 @@ def featurize(batch, device, augment_type, augment_eps, replicate, epoch, esm=No
         backbone_4x4 = torch.Tensor([])
 
     esmc_batch_lookup = build_esmc_batch_lookup(names, lengths, epoch, esmc_cache, esmc_length_to_proteins, num_real_negatives_max=esmc_num_real_negatives_max, real_neg_warmup_epochs=esmc_real_neg_warmup_epochs)
-    return (X, S, S_true, mask, lengths, chain_M, residue_idx, mask_self, chain_encoding_all, all_chain_lens, backbone_4x4, names, esmc_batch_lookup)
+
+    pairformer_lookup, pairformer_dim = load_pairformer_batch_lookup(names, lengths, pairformer_embeddings_dir, emb_dim=128)
+    pairformer_z = np.zeros((B, L_max, L_max, pairformer_dim if pairformer_dim is not None else 128), dtype=np.float32)
+    pairformer_mask = np.zeros((B, L_max, L_max), dtype=np.float32)
+    if pairformer_lookup is not None:
+        for i, name in enumerate(names):
+            z = pairformer_lookup.get(name)
+            if z is None:
+                continue
+            l = z.shape[0]
+            pairformer_z[i, :l, :l, :] = z
+            pairformer_mask[i, :l, :l] = 1.0
+
+    pairformer_z = torch.from_numpy(pairformer_z).to(dtype=torch.float32)
+    pairformer_mask = torch.from_numpy(pairformer_mask).to(dtype=torch.float32)
+
+    return (X, S, S_true, mask, lengths, chain_M, residue_idx, mask_self, chain_encoding_all, all_chain_lens, backbone_4x4, names, esmc_batch_lookup, pairformer_z, pairformer_mask)
 
 
 def loss_nll(S, log_probs, mask):
@@ -654,6 +702,51 @@ class ESMCContrastiveLoss(nn.Module):
         if len(losses) == 0:
             return torch.zeros((), device=log_probs.device), 0
         return torch.stack(losses).mean(), len(losses)
+
+class PairformerEdgeAlignmentLoss(nn.Module):
+    def __init__(self, pred_dim, target_dim=128, proj_dim=128, var_weight=0.01, var_target=1.0, eps=1e-8):
+        super().__init__()
+        self.proj = nn.Linear(pred_dim, proj_dim, bias=True) if pred_dim != proj_dim else nn.Identity()
+        self.target_proj = nn.Linear(target_dim, proj_dim, bias=True) if target_dim != proj_dim else nn.Identity()
+        self.var_weight = var_weight
+        self.var_target = var_target
+        self.eps = eps
+
+    def _variance_term(self, x):
+        if x.shape[0] <= 1:
+            return x.new_zeros(())
+        std = torch.sqrt(x.var(dim=0, unbiased=False) + self.eps)
+        return torch.mean(F.relu(self.var_target - std))
+
+    def forward(self, h_E, E_idx, pairformer_z, pairformer_mask, node_mask):
+        bsz, n_res, k, _ = h_E.shape
+        tgt_dim = pairformer_z.shape[-1]
+
+        gather_idx = E_idx.unsqueeze(-1).expand(-1, -1, -1, tgt_dim)
+        pairformer_edges = torch.gather(pairformer_z, 2, gather_idx)
+
+        neighbor_mask = torch.gather(node_mask, 1, E_idx)
+        edge_valid = node_mask.unsqueeze(-1) * neighbor_mask
+        edge_pair_mask = torch.gather(pairformer_mask, 2, E_idx)
+        edge_valid = edge_valid * edge_pair_mask
+
+        valid = edge_valid > 0
+        if valid.sum().item() == 0:
+            return h_E.new_zeros(()), 0
+
+        pred = self.proj(h_E[valid])
+        tgt = self.target_proj(pairformer_edges[valid])
+
+        pred = F.normalize(pred, p=2, dim=-1)
+        tgt = F.normalize(tgt, p=2, dim=-1)
+
+        cosine_loss = 1.0 - (pred * tgt).sum(dim=-1)
+        cosine_loss = cosine_loss.mean()
+
+        var_loss = self._variance_term(pred)
+        loss = cosine_loss + self.var_weight * var_loss
+        return loss, int(valid.sum().item())
+
 
 def structure_loss(frames, backbone_4x4, mask, num_frames=1):
     from openfold.utils.loss import backbone_loss_per_frame
@@ -1650,7 +1743,7 @@ class ProteinMPNN(nn.Module):
             positions = None
 
 
-        return log_probs, etab, E_idx, frames, positions
+        return log_probs, etab, E_idx, h_E, frames, positions
 
     def forward_recycle(self, X, S, mask, chain_M, residue_idx, chain_encoding_all, all_chain_lens=None, epoch=1, replicate=1, num_recycles=3):
         """ Graph-conditioned sequence model """
@@ -1729,7 +1822,7 @@ class ProteinMPNN(nn.Module):
             # struct_loss, struct_loss_residue = 
 
 
-        return log_probs, etab, E_idx
+        return log_probs, etab, E_idx, h_E
 
 class NoamOpt:
     "Optim wrapper that implements rate."
