@@ -73,6 +73,7 @@ Input flags for `training.py`:
     argparser.add_argument("--debug", type=bool, default=False, help="minimal data loading for debugging")
     argparser.add_argument("--gradient_norm", type=float, default=-1.0, help="clip gradient norm, set to negative to omit clipping")
     argparser.add_argument("--mixed_precision", type=bool, default=True, help="train with mixed precision")
+    argparser.add_argument("--core_mpnn_only", type=int, default=0, help="when loading --previous_checkpoint, only restore core ProteinMPNN weights")
 ```
 -----------------------------------------------------------------------------------------------------
 For example to make a conda environment to run ProteinMPNN:
