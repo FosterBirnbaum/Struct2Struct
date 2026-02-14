@@ -66,11 +66,48 @@ def load_embedding_lookup(path):
 def make_aa_embedding_table(embedding_lookup):
     if embedding_lookup is None:
         return None
-    if '__aa_embedding_table__' in embedding_lookup:
-        table = torch.as_tensor(embedding_lookup['__aa_embedding_table__'], dtype=torch.float32)
-        if table.dim() != 2:
-            raise ValueError('AA embedding table must be rank-2 [vocab, dim].')
-        return table
+    if '__aa_embedding_table__' not in embedding_lookup:
+        return None
+    table = torch.as_tensor(embedding_lookup['__aa_embedding_table__'], dtype=torch.float32)
+    if table.dim() != 2:
+        raise ValueError('AA embedding table must be rank-2 [vocab, dim].')
+    return table
+
+
+CORE_PROTEIN_MPNN_PREFIXES = (
+    'features.',
+    'W_e.',
+    'W_s.',
+    'encoder_layers.',
+    'etab_out.',
+    'self_E_out.',
+    'decoder_layers.',
+    'W_out.',
+)
+
+
+def load_checkpoint_weights(model, checkpoint, strict=True, core_mpnn_only=False):
+    """Load model weights from checkpoint/state_dict with optional core-ProteinMPNN filtering."""
+    state_dict = checkpoint.get('model_state_dict', checkpoint)
+
+    if core_mpnn_only:
+        state_dict = {
+            key: value
+            for key, value in state_dict.items()
+            if key.startswith(CORE_PROTEIN_MPNN_PREFIXES)
+        }
+        missing_keys, unexpected_keys = model.load_state_dict(state_dict, strict=False)
+        print(
+            f'Loaded core ProteinMPNN weights with strict=False '
+            f'({len(state_dict)} tensors matched checkpoint).'
+        )
+        if missing_keys:
+            print(f'Missing keys while loading core ProteinMPNN weights: {missing_keys}')
+        if unexpected_keys:
+            print(f'Unexpected keys while loading core ProteinMPNN weights: {unexpected_keys}')
+        return
+
+    model.load_state_dict(state_dict, strict=strict)
     return None
 
 
@@ -377,7 +414,7 @@ def main(args):
         checkpoint = torch.load(PATH, map_location=device, weights_only=False)
         total_step = checkpoint['step'] #write total_step from the checkpoint
         epoch = checkpoint['epoch'] #write epoch from the checkpoint
-        model.load_state_dict(checkpoint['model_state_dict'], strict=args.strict)
+        load_checkpoint_weights(model, checkpoint, strict=args.strict, core_mpnn_only=args.core_mpnn_only)
     else:
         total_step = 0
         epoch = 0
@@ -895,6 +932,7 @@ if __name__ == "__main__":
     argparser.add_argument("--struct_predict_seq", type=int, default=1, help="whether to use sequence for end-to-end structure supervision")
     argparser.add_argument("--load_optimizer", type=int, default=1, help="whether to load optimizer when fine-tuning a model")
     argparser.add_argument("--strict", type=int, default=1, help="enforce match between path for old model and current model")
+    argparser.add_argument("--core_mpnn_only", type=int, default=0, help="when loading --previous_checkpoint, only restore core ProteinMPNN weights (features/encoder/Potts/decoder)")
     argparser.add_argument('--use_seq', type=int, default=1, help='whether to use sequence info in autoregressive decoding')
     argparser.add_argument("--consensus_seqs", type=str, default='', help="whether to use consensus sequences for sequence prediction")
     argparser.add_argument("--msa_seqs", type=int, default=0, help="whether to use msa sequences for sequence prediction")
@@ -937,6 +975,7 @@ if __name__ == "__main__":
     args.struct_predict_seq = args.struct_predict_seq == 1
     args.load_optimizer = args.load_optimizer == 1
     args.strict = args.strict == 1
+    args.core_mpnn_only = args.core_mpnn_only == 1
     args.clone = args.clone == 1
     args.use_seq = args.use_seq == 1
     args.msa_seqs = args.msa_seqs == 1
