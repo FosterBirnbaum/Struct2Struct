@@ -25,7 +25,7 @@ import multiprocessing as mp
 from concurrent.futures import ProcessPoolExecutor, wait, FIRST_COMPLETED, as_completed
 import esm as esmlib
 from utils import worker_init_fn, get_pdbs, loader_pdb, build_training_clusters, PDB_dataset, StructureDataset, StructureLoader, StructureSampler
-from model_utils import featurize, loss_smoothed, nlcpl, structure_loss, loss_nll, potts_singlesite_loss, get_std_opt, ProteinMPNN, ESMCContrastiveLoss, PairformerEdgeAlignmentLoss
+from model_utils import featurize, loss_smoothed, nlcpl, structure_loss, loss_nll, potts_singlesite_loss, get_std_opt, ProteinMPNN, ESMCContrastiveLoss, PairformerEdgeAlignmentLoss, gauge_fix_etab, etab_l2_regularization
 
 class AverageMeter:
     """Computes and stores the average and current value efficiently.
@@ -541,7 +541,19 @@ def main(args):
             if args.mixed_precision:
                 with torch.cuda.amp.autocast():
                     log_probs, etab, E_idx, h_E, frames, positions = model(X, S, mask, chain_M, residue_idx, chain_encoding_all, all_chain_lens, e, replicate=args.replicate)
+                    if args.potts_gauge_fix:
+                        etab = gauge_fix_etab(
+                            etab,
+                            center_singlesite=args.potts_center_singlesite,
+                            center_pairwise=args.potts_center_pairwise,
+                        )
                     _, loss_av_smoothed = loss_smoothed(S_true, log_probs, mask_for_loss, vocab, fixed_denom=args.fixed_denom)
+                    if args.potts_l2_singlesite > 0.0 or args.potts_l2_pairwise > 0.0:
+                        loss_av_smoothed += etab_l2_regularization(
+                            etab,
+                            singlesite_weight=args.potts_l2_singlesite,
+                            pairwise_weight=args.potts_l2_pairwise,
+                        )
                     if args.etab_loss:
                         nlcpl_loss, nlcpl_count = nlcpl(etab, E_idx, S_true, mask, fixed_denom=args.fixed_potts_denom)
                         if nlcpl_count > 0: loss_av_smoothed += nlcpl_loss
@@ -586,7 +598,19 @@ def main(args):
                 scaler.update()
             else:
                 log_probs, etab, E_idx, h_E, frames, positions = model(X, S, mask, chain_M, residue_idx, chain_encoding_all, all_chain_lens, e, replicate=args.replicate)
+                if args.potts_gauge_fix:
+                    etab = gauge_fix_etab(
+                        etab,
+                        center_singlesite=args.potts_center_singlesite,
+                        center_pairwise=args.potts_center_pairwise,
+                    )
                 _, loss_av_smoothed = loss_smoothed(S_true, log_probs, mask_for_loss, vocab, fixed_denom=args.fixed_denom)
+                if args.potts_l2_singlesite > 0.0 or args.potts_l2_pairwise > 0.0:
+                    loss_av_smoothed += etab_l2_regularization(
+                        etab,
+                        singlesite_weight=args.potts_l2_singlesite,
+                        pairwise_weight=args.potts_l2_pairwise,
+                    )
                 if args.etab_loss:
                         nlcpl_loss, nlcpl_count = nlcpl(etab, E_idx, S_true, mask, fixed_denom=args.fixed_potts_denom)
                         if nlcpl_count > 0: loss_av_smoothed += nlcpl_loss
@@ -881,6 +905,11 @@ if __name__ == "__main__":
     argparser.add_argument("--etab_singlesite_loss", type=int, default=0, help="whether to use singlesite Potts model loss")
     argparser.add_argument("--etab_loss_only", type=int, default=0, help="whether to only use Potts model loss")
     argparser.add_argument("--output_dim", type=int, default=400, help="Potts model output dimension")
+    argparser.add_argument("--potts_gauge_fix", type=int, default=0, help="whether to apply gauge-fixing to Potts energy tables before losses")
+    argparser.add_argument("--potts_center_singlesite", type=int, default=1, help="whether gauge-fixing should zero-center singlesite self energies")
+    argparser.add_argument("--potts_center_pairwise", type=int, default=1, help="whether gauge-fixing should apply zero-sum transform to pairwise energies")
+    argparser.add_argument("--potts_l2_singlesite", type=float, default=0.0, help="L2 regularization weight for Potts singlesite self energies")
+    argparser.add_argument("--potts_l2_pairwise", type=float, default=0.0, help="L2 regularization weight for Potts pairwise energies")
     argparser.add_argument("--node_self_sub", type=str, default=None, help="whether to use sequence probabilities as Potts model self energies")
     argparser.add_argument("--clone", type=int, default=1, help="whether to clone node tensors if using for Potts model self energies")
     argparser.add_argument("--seq_encoding", type=str, default="one_hot", help="Sequence encoding to use")
@@ -930,6 +959,9 @@ if __name__ == "__main__":
     args.etab_loss = args.etab_loss == 1
     args.etab_singlesite_loss = args.etab_singlesite_loss == 1
     args.etab_loss_only = args.etab_loss_only == 1
+    args.potts_gauge_fix = args.potts_gauge_fix == 1
+    args.potts_center_singlesite = args.potts_center_singlesite == 1
+    args.potts_center_pairwise = args.potts_center_pairwise == 1
     args.struct_predict = args.struct_predict == 1
     args.use_struct_weights = args.use_struct_weights == 1
     args.multimer_structure_module = args.multimer_structure_module == 1

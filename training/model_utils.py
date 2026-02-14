@@ -508,6 +508,61 @@ def nlcpl(etab, E_idx, S, mask, fixed_denom=0.0):
 
     return nlcpl_return, int(n_edges)
 
+
+def gauge_fix_etab(etab, center_singlesite=True, center_pairwise=True):
+    """Apply simple gauge-fixing transforms to Potts energy tables.
+
+    Args:
+        etab: [B, L, K, 400] tensor containing flattened 20x20 tables.
+        center_singlesite: zero-center self-site diagonal energies.
+        center_pairwise: apply zero-sum gauge to pairwise 20x20 matrices.
+    """
+    if not center_singlesite and not center_pairwise:
+        return etab
+
+    n_batch, L, k, n_out = etab.shape
+    if n_out != 400:
+        return etab
+
+    etab_2d = etab.view(n_batch, L, k, 20, 20).clone()
+
+    if center_singlesite:
+        self_etab = etab_2d[:, :, 0]
+        self_diag = torch.diagonal(self_etab, offset=0, dim1=-2, dim2=-1)
+        self_diag = self_diag - self_diag.mean(dim=-1, keepdim=True)
+        self_etab.diagonal(offset=0, dim1=-2, dim2=-1).copy_(self_diag)
+
+    if center_pairwise and k > 1:
+        pair_etab = etab_2d[:, :, 1:]
+        row_mean = pair_etab.mean(dim=-1, keepdim=True)
+        col_mean = pair_etab.mean(dim=-2, keepdim=True)
+        total_mean = pair_etab.mean(dim=(-2, -1), keepdim=True)
+        etab_2d[:, :, 1:] = pair_etab - row_mean - col_mean + total_mean
+
+    return etab_2d.reshape(n_batch, L, k, n_out)
+
+
+def etab_l2_regularization(etab, singlesite_weight=0.0, pairwise_weight=0.0):
+    """Return L2 regularization penalty for Potts energies."""
+    if singlesite_weight <= 0.0 and pairwise_weight <= 0.0:
+        return torch.zeros((), device=etab.device, dtype=etab.dtype)
+
+    n_batch, L, k, n_out = etab.shape
+    if n_out != 400:
+        return torch.zeros((), device=etab.device, dtype=etab.dtype)
+
+    etab_2d = etab.view(n_batch, L, k, 20, 20)
+    penalty = torch.zeros((), device=etab.device, dtype=etab.dtype)
+
+    if singlesite_weight > 0.0:
+        self_diag = torch.diagonal(etab_2d[:, :, 0], offset=0, dim1=-2, dim2=-1)
+        penalty = penalty + singlesite_weight * torch.mean(self_diag.square())
+
+    if pairwise_weight > 0.0 and k > 1:
+        penalty = penalty + pairwise_weight * torch.mean(etab_2d[:, :, 1:].square())
+
+    return penalty
+
 def potts_singlesite_loss(etab, E_idx, S, mask, vocab, weight=0.1, from_val=False):
     ref_seqs = S
     n_batch, L, k, _ = etab.shape
