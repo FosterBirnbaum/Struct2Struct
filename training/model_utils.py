@@ -66,6 +66,34 @@ def _esm_featurize(seq, chain_lens, esm, batch_converter, esm_embed_layer, devic
         embs = embs[mask]
     return embs
 
+
+
+def _extract_npz_array(npz_obj, keys, fallback_index=None):
+    for k in keys:
+        if k in npz_obj.files:
+            return npz_obj[k]
+    if fallback_index is not None and len(npz_obj.files) > fallback_index:
+        return npz_obj[npz_obj.files[fallback_index]]
+    return None
+
+
+def _load_esmc_npz_for_protein(embeddings_dir, name):
+    if not embeddings_dir:
+        return None
+    npz_path = os.path.join(embeddings_dir, f'embeddings_{name}.npz')
+    if not os.path.exists(npz_path):
+        return None
+    data = np.load(npz_path)
+    msa = _extract_npz_array(data, ['msa', 'msa_embeddings', 'arr_0'], fallback_index=0)
+    rnd = _extract_npz_array(data, ['random', 'rand', 'random_embeddings', 'arr_1'], fallback_index=1)
+    if msa is None or rnd is None:
+        return None
+    if msa.ndim == 3:
+        msa = msa.mean(axis=1)
+    if rnd.ndim == 3:
+        rnd = rnd.mean(axis=1)
+    return {'msa': msa.astype(np.float32), 'random': rnd.astype(np.float32)}
+
 def _pick_real_negative_name(name, target_length, length_to_proteins, esmc_cache):
     same = [p for p in length_to_proteins.get(int(target_length), []) if p != name and p in esmc_cache]
     if same:
@@ -78,23 +106,32 @@ def _pick_real_negative_name(name, target_length, length_to_proteins, esmc_cache
     return None
 
 
-def build_esmc_batch_lookup(names, lengths, epoch, esmc_cache, length_to_proteins, num_real_negatives_max=16, real_neg_warmup_epochs=50):
-    if esmc_cache is None:
+def build_esmc_batch_lookup(names, lengths, epoch, esmc_cache, length_to_proteins, num_real_negatives_max=16, real_neg_warmup_epochs=50, esmc_embeddings_dir=''):
+    if esmc_cache is None and not esmc_embeddings_dir:
         return None
+
     out = {}
     real_frac = min(float(epoch + 1) / float(max(real_neg_warmup_epochs, 1)), 1.0)
     n_real = int(round(real_frac * num_real_negatives_max))
     for name, length in zip(names, lengths):
-        info = esmc_cache.get(name)
+        info = esmc_cache.get(name) if esmc_cache is not None else None
+        if info is None:
+            info = _load_esmc_npz_for_protein(esmc_embeddings_dir, name)
         if info is None:
             continue
+
         item = {'msa': info.get('msa'), 'random': info.get('random')}
         real_list = []
         for _ in range(n_real):
-            neg_name = _pick_real_negative_name(name, int(length), length_to_proteins, esmc_cache)
+            neg_name = _pick_real_negative_name(name, int(length), length_to_proteins, esmc_cache or {})
             if neg_name is None:
                 continue
-            neg_rows = esmc_cache[neg_name].get('msa')
+            neg_info = esmc_cache.get(neg_name) if esmc_cache is not None else None
+            if neg_info is None:
+                neg_info = _load_esmc_npz_for_protein(esmc_embeddings_dir, neg_name)
+            if neg_info is None:
+                continue
+            neg_rows = neg_info.get('msa')
             if neg_rows is not None and len(neg_rows) > 0:
                 pick = neg_rows[np.random.randint(0, len(neg_rows))]
                 real_list.append(pick)
@@ -136,7 +173,7 @@ def load_pairformer_batch_lookup(names, lengths, pairformer_embeddings_dir, emb_
     return pairformer_lookup, emb_dim
 
 
-def featurize(batch, device, augment_type, augment_eps, replicate, epoch, esm=None, batch_converter=None, esm_embed_dim=2560, esm_embed_layer=36, one_hot=False, return_esm=False, openfold_backbone=False, msa_seqs=False, msa_batch_size=10, esmc_cache=None, esmc_length_to_proteins=None, esmc_num_real_negatives_max=16, esmc_real_neg_warmup_epochs=50, pairformer_embeddings_dir=""):
+def featurize(batch, device, augment_type, augment_eps, replicate, epoch, esm=None, batch_converter=None, esm_embed_dim=2560, esm_embed_layer=36, one_hot=False, return_esm=False, openfold_backbone=False, msa_seqs=False, msa_batch_size=10, esmc_cache=None, esmc_embeddings_dir='', esmc_length_to_proteins=None, esmc_num_real_negatives_max=16, esmc_real_neg_warmup_epochs=50, pairformer_embeddings_dir=""):
     alphabet = 'ACDEFGHIKLMNPQRSTVWYX-'
 
     if msa_seqs:
@@ -358,7 +395,7 @@ def featurize(batch, device, augment_type, augment_eps, replicate, epoch, esm=No
     else:
         backbone_4x4 = torch.Tensor([])
 
-    esmc_batch_lookup = build_esmc_batch_lookup(names, lengths, epoch, esmc_cache, esmc_length_to_proteins, num_real_negatives_max=esmc_num_real_negatives_max, real_neg_warmup_epochs=esmc_real_neg_warmup_epochs)
+    esmc_batch_lookup = build_esmc_batch_lookup(names, lengths, epoch, esmc_cache, esmc_length_to_proteins or {}, num_real_negatives_max=esmc_num_real_negatives_max, real_neg_warmup_epochs=esmc_real_neg_warmup_epochs, esmc_embeddings_dir=esmc_embeddings_dir)
 
     pairformer_lookup, pairformer_dim = load_pairformer_batch_lookup(names, lengths, pairformer_embeddings_dir, emb_dim=128)
     pairformer_z = np.zeros((B, L_max, L_max, pairformer_dim if pairformer_dim is not None else 128), dtype=np.float32)
@@ -623,7 +660,7 @@ class ESMCContrastiveLoss(nn.Module):
     def __init__(
         self,
         aa_embedding_table,
-        embedding_lookup,
+        embedding_lookup=None,
         temperature=0.07,
         gumbel_tau=1.0,
         num_random_negatives=16,
@@ -633,7 +670,7 @@ class ESMCContrastiveLoss(nn.Module):
     ):
         super().__init__()
         self.register_buffer("aa_embedding_table", aa_embedding_table.float())
-        self.embedding_lookup = embedding_lookup
+        self.embedding_lookup = embedding_lookup or {}
         self.temperature = temperature
         self.gumbel_tau = gumbel_tau
         self.num_random_negatives = num_random_negatives
@@ -664,7 +701,11 @@ class ESMCContrastiveLoss(nn.Module):
                 self._seq_len_by_name[name] = seq_len
                 self._all_real_by_length.setdefault(seq_len, []).append(name)
 
-        if self.require_same_length_real_negatives and len(self._all_real_by_length) == 0:
+        if (
+            self.require_same_length_real_negatives
+            and len(self._all_real_by_length) == 0
+            and len(self.embedding_lookup) > 0
+        ):
             raise ValueError(
                 "No sequence lengths found in embedding_lookup for same-length real negatives. "
                 "Provide per-protein 'length' (or 'seq_len') metadata, or disable "
@@ -711,7 +752,11 @@ class ESMCContrastiveLoss(nn.Module):
 
         losses = []
         for i, name in enumerate(names):
-            sample_data = batch_embedding_lookup.get(name) if batch_embedding_lookup is not None else self.embedding_lookup.get(name)
+            sample_data = (
+                batch_embedding_lookup.get(name)
+                if batch_embedding_lookup is not None
+                else self.embedding_lookup.get(name)
+            )
             seq_len = int(mask[i].sum().item()) if self.require_same_length_real_negatives else None
             if sample_data is None:
                 continue
