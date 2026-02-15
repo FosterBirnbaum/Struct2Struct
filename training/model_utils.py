@@ -217,7 +217,7 @@ def load_pairformer_batch_lookup(names, lengths, pairformer_embeddings_dir, emb_
     return pairformer_lookup, emb_dim
 
 
-def featurize(batch, device, augment_type, augment_eps, replicate, epoch, esm=None, batch_converter=None, esm_embed_dim=2560, esm_embed_layer=36, one_hot=False, return_esm=False, openfold_backbone=False, msa_seqs=False, msa_batch_size=10, esmc_cache=None, esmc_embeddings_dir='', esmc_length_to_proteins=None, esmc_num_real_negatives_max=16, esmc_real_neg_warmup_epochs=50, esmc_protein_clusters=None, pairformer_embeddings_dir=""):
+def featurize(batch, device, augment_type, augment_eps, replicate, epoch, esm=None, batch_converter=None, esm_embed_dim=2560, esm_embed_layer=36, one_hot=False, return_esm=False, openfold_backbone=False, msa_seqs=False, msa_batch_size=10, esmc_cache=None, esmc_embeddings_dir='', esmc_protein_negatives=None, esmc_num_real_negatives_max=16, esmc_real_neg_warmup_epochs=50, esmc_protein_clusters=None, pairformer_embeddings_dir=""):
     alphabet = 'ACDEFGHIKLMNPQRSTVWYX-'
 
     if msa_seqs:
@@ -439,7 +439,7 @@ def featurize(batch, device, augment_type, augment_eps, replicate, epoch, esm=No
     else:
         backbone_4x4 = torch.Tensor([])
 
-    esmc_batch_lookup = build_esmc_batch_lookup(names, lengths, epoch, esmc_cache, esmc_length_to_proteins or {}, num_real_negatives_max=esmc_num_real_negatives_max, real_neg_warmup_epochs=esmc_real_neg_warmup_epochs, esmc_embeddings_dir=esmc_embeddings_dir, protein_clusters=esmc_protein_clusters)
+    esmc_batch_lookup = build_esmc_batch_lookup(names, lengths, epoch, esmc_cache, esmc_protein_negatives or {}, num_real_negatives_max=esmc_num_real_negatives_max, real_neg_warmup_epochs=esmc_real_neg_warmup_epochs, esmc_embeddings_dir=esmc_embeddings_dir, protein_clusters=esmc_protein_clusters)
 
     pairformer_lookup, pairformer_dim = load_pairformer_batch_lookup(names, lengths, pairformer_embeddings_dir, emb_dim=128)
     pairformer_z = np.zeros((B, L_max, L_max, pairformer_dim if pairformer_dim is not None else 128), dtype=np.float32)

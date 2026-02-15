@@ -140,13 +140,12 @@ def load_checkpoint_weights(model, checkpoint, strict=True, core_mpnn_only=False
     return None
 
 
-def load_esmc_cache(embeddings_dir, lengths_json):
-    if (not embeddings_dir) or (not lengths_json):
+def load_esmc_cache(embeddings_dir, negatives_pickle):
+    if (not embeddings_dir) or (not negatives_pickle):
         return None, None
-    with open(lengths_json, 'r') as f:
-        lengths_raw = json.load(f)
-    length_to_proteins = {int(k): v for k, v in lengths_raw.items()}
-    proteins = sorted({p for plist in length_to_proteins.values() for p in plist})
+    with open(negatives_pickle, 'rb') as f:
+        protein_negatives = pickle.load(f)
+    proteins = sorted({p for plist in protein_negatives.values() for p in plist})
 
     def _extract_npz_array(npz_obj, keys, fallback_index=None):
         for k in keys:
@@ -168,7 +167,9 @@ def load_esmc_cache(embeddings_dir, lengths_json):
         if msa.ndim == 3:
             msa = msa.mean(axis=1)
         cache[prot] = {'msa': msa.astype(np.float32)}
-    return cache, length_to_proteins
+    return cache, protein_negatives
+
+    
 def load_pickle_stream(path):
     with open(path, "rb") as f:
         while True:
@@ -453,7 +454,7 @@ def main(args):
 
     # Optional ESM-C contrastive objective.
     esmc_contrastive_loss = None
-    esmc_cache, esmc_length_to_proteins = None, None
+    esmc_cache, esmc_protein_negatives = None, None
     pairformer_edge_loss = None
     if args.pairformer_loss_weight > 0.0:
         pairformer_edge_loss = PairformerEdgeAlignmentLoss(
@@ -464,7 +465,7 @@ def main(args):
             var_target=args.pairformer_variance_target,
         ).to(device)
     if args.esmc_contrastive_weight > 0.0:
-        esmc_cache, esmc_length_to_proteins = load_esmc_cache(args.esmc_embeddings_dir, args.esmc_lengths_json)
+        esmc_cache, esmc_protein_negatives = load_esmc_cache(args.esmc_embeddings_dir, args.esmc_negatives_pickle)
         embedding_lookup = load_embedding_lookup(args.esmc_embedding_lookup)
 
         aa_embedding_table = load_aa_embedding_table(args.aa_embedding_table)
@@ -544,11 +545,11 @@ def main(args):
     # loader_train = StructureLoader(dataset_train, batch_size=args.batch_size)
     train_batch_sampler = StructureSampler(dataset_train, batch_size=args.batch_size, device=device, flex_type=args.noise_type, augment_eps=args.backbone_noise, replicate=args.replicate,
                                             esm=esm, batch_converter=batch_converter, esm_embed_layer=esm_embed_layer, esm_embed_dim=esm_embed_dim, one_hot=one_hot,
-                                            openfold_backbone=args.struct_predict, msa_seqs=args.msa_seqs, msa_batch_size=args.msa_batch_size, esmc_cache=esmc_cache, esmc_embeddings_dir=args.esmc_embeddings_dir, esmc_length_to_proteins=esmc_length_to_proteins, esmc_num_real_negatives_max=args.esmc_num_real_negatives_max, esmc_real_neg_warmup_epochs=args.esmc_real_neg_warmup_epochs, pairformer_embeddings_dir=args.pairformer_embeddings_dir)
+                                            openfold_backbone=args.struct_predict, msa_seqs=args.msa_seqs, msa_batch_size=args.msa_batch_size, esmc_cache=esmc_cache, esmc_embeddings_dir=args.esmc_embeddings_dir, esmc_protein_negatives=esmc_protein_negatives, esmc_num_real_negatives_max=args.esmc_num_real_negatives_max, esmc_real_neg_warmup_epochs=args.esmc_real_neg_warmup_epochs, pairformer_embeddings_dir=args.pairformer_embeddings_dir)
     loader_train = DataLoader(dataset_train, batch_sampler=train_batch_sampler, collate_fn=train_batch_sampler.package, pin_memory=True, **kwargs)
     # loader_valid = StructureLoader(dataset_valid, batch_size=args.batch_size)
     valid_batch_sampler = StructureSampler(dataset_valid, batch_size=args.batch_size, device=device, esm=esm, batch_converter=batch_converter, esm_embed_layer=esm_embed_layer,
-                                            esm_embed_dim=esm_embed_dim, one_hot=one_hot, openfold_backbone=args.struct_predict, msa_seqs=args.msa_seqs, msa_batch_size=args.msa_batch_size, esmc_cache=esmc_cache, esmc_embeddings_dir=args.esmc_embeddings_dir, esmc_length_to_proteins=esmc_length_to_proteins, esmc_num_real_negatives_max=args.esmc_num_real_negatives_max, esmc_real_neg_warmup_epochs=args.esmc_real_neg_warmup_epochs, pairformer_embeddings_dir=args.pairformer_embeddings_dir)
+                                            esm_embed_dim=esm_embed_dim, one_hot=one_hot, openfold_backbone=args.struct_predict, msa_seqs=args.msa_seqs, msa_batch_size=args.msa_batch_size, esmc_cache=esmc_cache, esmc_embeddings_dir=args.esmc_embeddings_dir, esmc_protein_negatives=esmc_protein_negatives, esmc_num_real_negatives_max=args.esmc_num_real_negatives_max, esmc_real_neg_warmup_epochs=args.esmc_real_neg_warmup_epochs, pairformer_embeddings_dir=args.pairformer_embeddings_dir)
     loader_valid = DataLoader(dataset_valid, batch_sampler=valid_batch_sampler, collate_fn=valid_batch_sampler.package, pin_memory=True, **kwargs)
     reload_c = 0 
     best_val_loss = np.inf
@@ -578,11 +579,11 @@ def main(args):
                 
                 dataset_train = StructureDataset(pdb_dict_train, truncate=None, max_length=args.max_protein_length)
                 train_batch_sampler = StructureSampler(dataset_train, batch_size=args.batch_size, device=device, flex_type=args.noise_type, augment_eps=args.backbone_noise, replicate=args.replicate, esm=esm, batch_converter=batch_converter,
-                                                        esm_embed_layer=esm_embed_layer, esm_embed_dim=esm_embed_dim, one_hot=one_hot, openfold_backbone=args.struct_predict, msa_seqs=args.msa_seqs, msa_batch_size=args.msa_batch_size, esmc_cache=esmc_cache, esmc_embeddings_dir=args.esmc_embeddings_dir, esmc_length_to_proteins=esmc_length_to_proteins, esmc_num_real_negatives_max=args.esmc_num_real_negatives_max, esmc_real_neg_warmup_epochs=args.esmc_real_neg_warmup_epochs, pairformer_embeddings_dir=args.pairformer_embeddings_dir)
+                                                        esm_embed_layer=esm_embed_layer, esm_embed_dim=esm_embed_dim, one_hot=one_hot, openfold_backbone=args.struct_predict, msa_seqs=args.msa_seqs, msa_batch_size=args.msa_batch_size, esmc_cache=esmc_cache, esmc_embeddings_dir=args.esmc_embeddings_dir, esmc_protein_negatives=esmc_protein_negatives, esmc_num_real_negatives_max=args.esmc_num_real_negatives_max, esmc_real_neg_warmup_epochs=args.esmc_real_neg_warmup_epochs, pairformer_embeddings_dir=args.pairformer_embeddings_dir)
                 loader_train = DataLoader(dataset_train, batch_sampler=train_batch_sampler, collate_fn=train_batch_sampler.package, pin_memory=True, **kwargs)
                 dataset_valid = StructureDataset(pdb_dict_valid, truncate=None, max_length=args.max_protein_length)
                 valid_batch_sampler = StructureSampler(dataset_valid, batch_size=args.batch_size, device=device, esm=esm, batch_converter=batch_converter, esm_embed_layer=esm_embed_layer, esm_embed_dim=esm_embed_dim, one_hot=one_hot,
-                                                        openfold_backbone=args.struct_predict, msa_seqs=args.msa_seqs, msa_batch_size=args.msa_batch_size, esmc_cache=esmc_cache, esmc_embeddings_dir=args.esmc_embeddings_dir, esmc_length_to_proteins=esmc_length_to_proteins, esmc_num_real_negatives_max=args.esmc_num_real_negatives_max, esmc_real_neg_warmup_epochs=args.esmc_real_neg_warmup_epochs, pairformer_embeddings_dir=args.pairformer_embeddings_dir)
+                                                        openfold_backbone=args.struct_predict, msa_seqs=args.msa_seqs, msa_batch_size=args.msa_batch_size, esmc_cache=esmc_cache, esmc_embeddings_dir=args.esmc_embeddings_dir, esmc_protein_negatives=esmc_protein_negatives, esmc_num_real_negatives_max=args.esmc_num_real_negatives_max, esmc_real_neg_warmup_epochs=args.esmc_real_neg_warmup_epochs, pairformer_embeddings_dir=args.pairformer_embeddings_dir)
                 loader_valid = DataLoader(dataset_valid, batch_sampler=valid_batch_sampler, collate_fn=valid_batch_sampler.package, pin_memory=True, **kwargs)
 
             reload_c += 1
@@ -1016,7 +1017,7 @@ if __name__ == "__main__":
     argparser.add_argument("--esmc_embedding_lookup", type=str, default='', help="optional legacy pickle containing ESM-C embeddings for msa/random sequences and/or __aa_embedding_table__")
     argparser.add_argument("--aa_embedding_table", type=str, default='', help="path to standalone AA embedding table (.npy/.npz/.pt/.pth)")
     argparser.add_argument("--esmc_embeddings_dir", type=str, default='', help="directory containing embeddings_<prot>.npz files")
-    argparser.add_argument("--esmc_lengths_json", type=str, default='', help="optional json mapping lengths to proteins for real-negative sampling")
+    argparser.add_argument("--esmc_negatives_pickle", type=str, default='', help="optional pickle mapping proteins to real negatives")
     argparser.add_argument("--esmc_temperature", type=float, default=0.07, help="temperature for ESM-C contrastive loss")
     argparser.add_argument("--esmc_gumbel_tau", type=float, default=1.0, help="Gumbel-Softmax temperature for differentiable sequence sampling")
     argparser.add_argument("--esmc_num_random_negatives", type=int, default=16, help="number of random-sequence negatives per sample")
