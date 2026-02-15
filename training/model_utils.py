@@ -84,35 +84,91 @@ def _load_esmc_npz_for_protein(embeddings_dir, name):
     if not os.path.exists(npz_path):
         return None
     data = np.load(npz_path)
-    msa = _extract_npz_array(data, ['msa', 'msa_embeddings', 'arr_0'], fallback_index=0)
-    rnd = _extract_npz_array(data, ['random', 'rand', 'random_embeddings', 'arr_1'], fallback_index=1)
-    if msa is None or rnd is None:
+    msa = _extract_npz_array(data, ['msa_embeddings', 'msa', 'arr_0'], fallback_index=0)
+    if msa is None:
         return None
     if msa.ndim == 3:
         msa = msa.mean(axis=1)
-    if rnd.ndim == 3:
-        rnd = rnd.mean(axis=1)
-    return {'msa': msa.astype(np.float32), 'random': rnd.astype(np.float32)}
+    return {'msa': msa.astype(np.float32)}
 
-def _pick_real_negative_name(name, target_length, length_to_proteins, esmc_cache):
-    same = [p for p in length_to_proteins.get(int(target_length), []) if p != name and p in esmc_cache]
+
+def _load_esmc_npz_for_length(embeddings_dir, target_length, length_npz_cache, available_lengths):
+    if not embeddings_dir:
+        return None
+
+    if target_length in length_npz_cache:
+        return length_npz_cache[target_length]
+
+    if target_length in available_lengths:
+        chosen_length = target_length
+    elif len(available_lengths) > 0:
+        chosen_length = min(available_lengths, key=lambda x: abs(x - int(target_length)))
+    else:
+        length_npz_cache[target_length] = None
+        return None
+
+    npz_path = os.path.join(embeddings_dir, f'embeddings_len_{int(chosen_length)}.npz')
+    if not os.path.exists(npz_path):
+        length_npz_cache[target_length] = None
+        return None
+
+    data = np.load(npz_path)
+    msa = _extract_npz_array(data, ['msa_embeddings', 'msa', 'arr_0'], fallback_index=0)
+    if msa is None:
+        length_npz_cache[target_length] = None
+        return None
+    if msa.ndim == 3:
+        msa = msa.mean(axis=1)
+    out = msa.astype(np.float32)
+    length_npz_cache[target_length] = out
+    return out
+
+
+def _pick_real_negative_name(name, target_length, length_to_proteins, available_names=None, forbidden_cluster=None, name_to_cluster=None):
+    def _valid_candidate(prot_name):
+        if prot_name == name:
+            return False
+        if available_names is not None and prot_name not in available_names:
+            return False
+        if forbidden_cluster is not None and name_to_cluster is not None:
+            if name_to_cluster.get(prot_name) == forbidden_cluster:
+                return False
+        return True
+
+    same = [p for p in length_to_proteins.get(int(target_length), []) if _valid_candidate(p)]
     if same:
         return random.choice(same)
     length_keys = sorted([int(k) for k in length_to_proteins.keys()], key=lambda x: abs(x - int(target_length)))
     for L in length_keys:
-        candidates = [p for p in length_to_proteins.get(int(L), []) if p != name and p in esmc_cache]
+        candidates = [p for p in length_to_proteins.get(int(L), []) if _valid_candidate(p)]
         if candidates:
             return random.choice(candidates)
     return None
 
 
-def build_esmc_batch_lookup(names, lengths, epoch, esmc_cache, length_to_proteins, num_real_negatives_max=16, real_neg_warmup_epochs=50, esmc_embeddings_dir=''):
+def build_esmc_batch_lookup(names, lengths, epoch, esmc_cache, length_to_proteins, num_real_negatives_max=16, real_neg_warmup_epochs=50, esmc_embeddings_dir='', protein_clusters=None):
     if esmc_cache is None and not esmc_embeddings_dir:
         return None
 
     out = {}
     real_frac = min(float(epoch + 1) / float(max(real_neg_warmup_epochs, 1)), 1.0)
     n_real = int(round(real_frac * num_real_negatives_max))
+    available_names = set(esmc_cache.keys()) if esmc_cache is not None else None
+    name_to_cluster = None
+    if protein_clusters:
+        name_to_cluster = {}
+        for cluster_id, members in protein_clusters.items():
+            for prot_name in members:
+                name_to_cluster[prot_name] = cluster_id
+
+    available_lengths = set()
+    if esmc_embeddings_dir:
+        for npz_path in glob.glob(os.path.join(esmc_embeddings_dir, 'embeddings_len_*.npz')):
+            m = re.search(r'embeddings_len_(\d+)\.npz$', os.path.basename(npz_path))
+            if m:
+                available_lengths.add(int(m.group(1)))
+    length_npz_cache = {}
+
     for name, length in zip(names, lengths):
         info = esmc_cache.get(name) if esmc_cache is not None else None
         if info is None:
@@ -120,10 +176,22 @@ def build_esmc_batch_lookup(names, lengths, epoch, esmc_cache, length_to_protein
         if info is None:
             continue
 
-        item = {'msa': info.get('msa'), 'random': info.get('random')}
+        random_rows = info.get('random')
+        if random_rows is None:
+            random_rows = _load_esmc_npz_for_length(esmc_embeddings_dir, int(length), length_npz_cache, available_lengths)
+
+        item = {'msa': info.get('msa'), 'random': random_rows}
         real_list = []
+        current_cluster = name_to_cluster.get(name) if name_to_cluster is not None else None
         for _ in range(n_real):
-            neg_name = _pick_real_negative_name(name, int(length), length_to_proteins, esmc_cache or {})
+            neg_name = _pick_real_negative_name(
+                name,
+                int(length),
+                length_to_proteins,
+                available_names=available_names,
+                forbidden_cluster=current_cluster,
+                name_to_cluster=name_to_cluster,
+            )
             if neg_name is None:
                 continue
             neg_info = esmc_cache.get(neg_name) if esmc_cache is not None else None
@@ -173,7 +241,7 @@ def load_pairformer_batch_lookup(names, lengths, pairformer_embeddings_dir, emb_
     return pairformer_lookup, emb_dim
 
 
-def featurize(batch, device, augment_type, augment_eps, replicate, epoch, esm=None, batch_converter=None, esm_embed_dim=2560, esm_embed_layer=36, one_hot=False, return_esm=False, openfold_backbone=False, msa_seqs=False, msa_batch_size=10, esmc_cache=None, esmc_embeddings_dir='', esmc_length_to_proteins=None, esmc_num_real_negatives_max=16, esmc_real_neg_warmup_epochs=50, pairformer_embeddings_dir=""):
+def featurize(batch, device, augment_type, augment_eps, replicate, epoch, esm=None, batch_converter=None, esm_embed_dim=2560, esm_embed_layer=36, one_hot=False, return_esm=False, openfold_backbone=False, msa_seqs=False, msa_batch_size=10, esmc_cache=None, esmc_embeddings_dir='', esmc_length_to_proteins=None, esmc_num_real_negatives_max=16, esmc_real_neg_warmup_epochs=50, esmc_protein_clusters=None, pairformer_embeddings_dir=""):
     alphabet = 'ACDEFGHIKLMNPQRSTVWYX-'
 
     if msa_seqs:
@@ -395,7 +463,7 @@ def featurize(batch, device, augment_type, augment_eps, replicate, epoch, esm=No
     else:
         backbone_4x4 = torch.Tensor([])
 
-    esmc_batch_lookup = build_esmc_batch_lookup(names, lengths, epoch, esmc_cache, esmc_length_to_proteins or {}, num_real_negatives_max=esmc_num_real_negatives_max, real_neg_warmup_epochs=esmc_real_neg_warmup_epochs, esmc_embeddings_dir=esmc_embeddings_dir)
+    esmc_batch_lookup = build_esmc_batch_lookup(names, lengths, epoch, esmc_cache, esmc_length_to_proteins or {}, num_real_negatives_max=esmc_num_real_negatives_max, real_neg_warmup_epochs=esmc_real_neg_warmup_epochs, esmc_embeddings_dir=esmc_embeddings_dir, protein_clusters=esmc_protein_clusters)
 
     pairformer_lookup, pairformer_dim = load_pairformer_batch_lookup(names, lengths, pairformer_embeddings_dir, emb_dim=128)
     pairformer_z = np.zeros((B, L_max, L_max, pairformer_dim if pairformer_dim is not None else 128), dtype=np.float32)
