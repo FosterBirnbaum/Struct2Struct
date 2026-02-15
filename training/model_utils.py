@@ -124,29 +124,16 @@ def _load_esmc_npz_for_length(embeddings_dir, target_length, length_npz_cache, a
     return out
 
 
-def _pick_real_negative_name(name, target_length, length_to_proteins, available_names=None, forbidden_cluster=None, name_to_cluster=None):
-    def _valid_candidate(prot_name):
-        if prot_name == name:
-            return False
-        if available_names is not None and prot_name not in available_names:
-            return False
-        if forbidden_cluster is not None and name_to_cluster is not None:
-            if name_to_cluster.get(prot_name) == forbidden_cluster:
-                return False
-        return True
-
-    same = [p for p in length_to_proteins.get(int(target_length), []) if _valid_candidate(p)]
-    if same:
-        return random.choice(same)
-    length_keys = sorted([int(k) for k in length_to_proteins.keys()], key=lambda x: abs(x - int(target_length)))
-    for L in length_keys:
-        candidates = [p for p in length_to_proteins.get(int(L), []) if _valid_candidate(p)]
-        if candidates:
-            return random.choice(candidates)
+def _pick_real_negative_name(name, protein_to_negatives, available_names=None):
+    candidates = protein_to_negatives.get(name, [])
+    if available_names is not None:
+        candidates = [prot_name for prot_name in candidates if prot_name in available_names]
+    if candidates:
+        return random.choice(candidates)
     return None
 
 
-def build_esmc_batch_lookup(names, lengths, epoch, esmc_cache, length_to_proteins, num_real_negatives_max=16, real_neg_warmup_epochs=50, esmc_embeddings_dir='', protein_clusters=None):
+def build_esmc_batch_lookup(names, lengths, epoch, esmc_cache, protein_to_negatives, num_real_negatives_max=16, real_neg_warmup_epochs=50, esmc_embeddings_dir='', protein_clusters=None):
     if esmc_cache is None and not esmc_embeddings_dir:
         return None
 
@@ -154,13 +141,6 @@ def build_esmc_batch_lookup(names, lengths, epoch, esmc_cache, length_to_protein
     real_frac = min(float(epoch + 1) / float(max(real_neg_warmup_epochs, 1)), 1.0)
     n_real = int(round(real_frac * num_real_negatives_max))
     available_names = set(esmc_cache.keys()) if esmc_cache is not None else None
-    name_to_cluster = None
-    if protein_clusters:
-        name_to_cluster = {}
-        for cluster_id, members in protein_clusters.items():
-            for prot_name in members:
-                name_to_cluster[prot_name] = cluster_id
-
     available_lengths = set()
     if esmc_embeddings_dir:
         for npz_path in glob.glob(os.path.join(esmc_embeddings_dir, 'embeddings_len_*.npz')):
@@ -182,15 +162,11 @@ def build_esmc_batch_lookup(names, lengths, epoch, esmc_cache, length_to_protein
 
         item = {'msa': info.get('msa'), 'random': random_rows}
         real_list = []
-        current_cluster = name_to_cluster.get(name) if name_to_cluster is not None else None
         for _ in range(n_real):
             neg_name = _pick_real_negative_name(
                 name,
-                int(length),
-                length_to_proteins,
+                protein_to_negatives,
                 available_names=available_names,
-                forbidden_cluster=current_cluster,
-                name_to_cluster=name_to_cluster,
             )
             if neg_name is None:
                 continue
