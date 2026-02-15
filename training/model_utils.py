@@ -133,7 +133,7 @@ def _pick_real_negative_name(name, protein_to_negatives, available_names=None):
     return None
 
 
-def build_esmc_batch_lookup(names, lengths, epoch, esmc_cache, protein_to_negatives, num_real_negatives_max=16, real_neg_warmup_epochs=50, esmc_embeddings_dir='', protein_clusters=None):
+def build_esmc_batch_lookup(names, lengths, epoch, esmc_cache, protein_to_negatives, num_real_negatives_max=16, real_neg_warmup_epochs=50, esmc_embeddings_dir='', protein_clusters=None, generate_random_negatives_each_iteration=False):
     if esmc_cache is None and not esmc_embeddings_dir:
         return None
 
@@ -156,8 +156,8 @@ def build_esmc_batch_lookup(names, lengths, epoch, esmc_cache, protein_to_negati
         if info is None:
             continue
 
-        random_rows = info.get('random')
-        if random_rows is None:
+        random_rows = None if generate_random_negatives_each_iteration else info.get('random')
+        if random_rows is None and not generate_random_negatives_each_iteration:
             random_rows = _load_esmc_npz_for_length(esmc_embeddings_dir, int(length), length_npz_cache, available_lengths)
 
         item = {'msa': info.get('msa'), 'random': random_rows}
@@ -217,7 +217,7 @@ def load_pairformer_batch_lookup(names, lengths, pairformer_embeddings_dir, emb_
     return pairformer_lookup, emb_dim
 
 
-def featurize(batch, device, augment_type, augment_eps, replicate, epoch, esm=None, batch_converter=None, esm_embed_dim=2560, esm_embed_layer=36, one_hot=False, return_esm=False, openfold_backbone=False, msa_seqs=False, msa_batch_size=10, esmc_cache=None, esmc_embeddings_dir='', esmc_protein_negatives=None, esmc_num_real_negatives_max=16, esmc_real_neg_warmup_epochs=50, esmc_protein_clusters=None, pairformer_embeddings_dir=""):
+def featurize(batch, device, augment_type, augment_eps, replicate, epoch, esm=None, batch_converter=None, esm_embed_dim=2560, esm_embed_layer=36, one_hot=False, return_esm=False, openfold_backbone=False, msa_seqs=False, msa_batch_size=10, esmc_cache=None, esmc_embeddings_dir='', esmc_protein_negatives=None, esmc_num_real_negatives_max=16, esmc_real_neg_warmup_epochs=50, esmc_protein_clusters=None, esmc_generate_random_negatives_each_iteration=False, pairformer_embeddings_dir=""):
     alphabet = 'ACDEFGHIKLMNPQRSTVWYX-'
 
     if msa_seqs:
@@ -439,7 +439,7 @@ def featurize(batch, device, augment_type, augment_eps, replicate, epoch, esm=No
     else:
         backbone_4x4 = torch.Tensor([])
 
-    esmc_batch_lookup = build_esmc_batch_lookup(names, lengths, epoch, esmc_cache, esmc_protein_negatives or {}, num_real_negatives_max=esmc_num_real_negatives_max, real_neg_warmup_epochs=esmc_real_neg_warmup_epochs, esmc_embeddings_dir=esmc_embeddings_dir, protein_clusters=esmc_protein_clusters)
+    esmc_batch_lookup = build_esmc_batch_lookup(names, lengths, epoch, esmc_cache, esmc_protein_negatives or {}, num_real_negatives_max=esmc_num_real_negatives_max, real_neg_warmup_epochs=esmc_real_neg_warmup_epochs, esmc_embeddings_dir=esmc_embeddings_dir, protein_clusters=esmc_protein_clusters, generate_random_negatives_each_iteration=esmc_generate_random_negatives_each_iteration)
 
     pairformer_lookup, pairformer_dim = load_pairformer_batch_lookup(names, lengths, pairformer_embeddings_dir, emb_dim=128)
     pairformer_z = np.zeros((B, L_max, L_max, pairformer_dim if pairformer_dim is not None else 128), dtype=np.float32)
@@ -711,6 +711,7 @@ class ESMCContrastiveLoss(nn.Module):
         num_real_negatives_max=16,
         real_neg_warmup_epochs=50,
         require_same_length_real_negatives=True,
+        generate_random_negatives_each_iteration=False,
     ):
         super().__init__()
         self.register_buffer("aa_embedding_table", aa_embedding_table.float())
@@ -721,6 +722,7 @@ class ESMCContrastiveLoss(nn.Module):
         self.num_real_negatives_max = num_real_negatives_max
         self.real_neg_warmup_epochs = max(real_neg_warmup_epochs, 1)
         self.require_same_length_real_negatives = require_same_length_real_negatives
+        self.generate_random_negatives_each_iteration = generate_random_negatives_each_iteration
 
         # Global MSA pool used for "real" negatives from other proteins.
         self._all_real = {}
@@ -769,6 +771,14 @@ class ESMCContrastiveLoss(nn.Module):
         idx = torch.randperm(rows.shape[0], device=rows.device)[:n_rows]
         return rows[idx]
 
+    def _sample_true_random_negatives(self, seq_len, n_rows):
+        if n_rows <= 0 or seq_len <= 0:
+            return None
+        vocab = self.aa_embedding_table.shape[0]
+        token_idx = torch.randint(0, vocab, (n_rows, seq_len), device=self.aa_embedding_table.device)
+        rows = self.aa_embedding_table[token_idx].mean(dim=1)
+        return rows
+
 
     def _candidate_real_negative_names(self, name, seq_len):
         if self.require_same_length_real_negatives:
@@ -806,8 +816,19 @@ class ESMCContrastiveLoss(nn.Module):
                 continue
 
             pos = self._sample_rows(sample_data.get('msa'), self.num_random_negatives)
-            rand_neg = self._sample_rows(sample_data.get('random'), self.num_random_negatives)
+            if self.generate_random_negatives_each_iteration:
+                rand_neg = self._sample_true_random_negatives(int(mask[i].sum().item()), self.num_random_negatives)
+            else:
+                rand_neg = self._sample_rows(sample_data.get('random'), self.num_random_negatives)
             if pos is None or rand_neg is None:
+                continue
+
+            if pos.shape[0] > rand_neg.shape[0]:
+                pos = self._sample_rows(pos, rand_neg.shape[0])
+            elif rand_neg.shape[0] > pos.shape[0]:
+                rand_neg = self._sample_rows(rand_neg, pos.shape[0])
+
+            if pos is None or rand_neg is None or pos.shape[0] == 0:
                 continue
 
             real_negs = []
