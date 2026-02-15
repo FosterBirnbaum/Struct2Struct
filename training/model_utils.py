@@ -793,7 +793,7 @@ class ESMCContrastiveLoss(nn.Module):
 
     def forward(self, log_probs, mask, names, epoch, batch_embedding_lookup=None):
         # Differentiable discrete sampling of predicted sequence.
-        aa_probs = F.gumbel_softmax(log_probs, tau=self.gumbel_tau, hard=False, dim=-1)
+        aa_probs = F.gumbel_softmax(log_probs, tau=self.gumbel_tau, hard=True, dim=-1)
         token_embs = aa_probs @ self.aa_embedding_table
 
         seq_mask = mask.unsqueeze(-1)
@@ -1722,7 +1722,7 @@ class MultiLayerLinear(nn.Module):
 class ProteinMPNN(nn.Module):
     def __init__(self, num_letters=21, node_features=128, edge_features=128,
         hidden_dim=128, output_dim=400, num_encoder_layers=3, num_decoder_layers=3, seq_encoding='one_hot',
-        vocab=21, k_neighbors=32, augment_eps=0.1, augment_type='atomic', augment_lim=1.0, dropout=0.1, feat_type='protein_mpnn', use_potts=False, node_self_sub=None, clone=True, struct_predict=False, use_struct_weights=True, multimer_structure_module=False, struct_predict_pairs=True, struct_predict_seq=True, use_seq=True, device='cuda:0' ):
+        vocab=21, k_neighbors=32, augment_eps=0.1, augment_type='atomic', augment_lim=1.0, dropout=0.1, feat_type='protein_mpnn', use_potts=False, node_self_sub=None, clone=True, struct_predict=False, use_struct_weights=True, multimer_structure_module=False, struct_predict_pairs=True, struct_predict_seq=True, use_seq=True, struct_seq_use_gumbel=False, struct_seq_gumbel_tau=1.0, device='cuda:0' ):
         super(ProteinMPNN, self).__init__()
         # Hyperparameters
         self.node_features = node_features
@@ -1735,6 +1735,8 @@ class ProteinMPNN(nn.Module):
         self.struct_predict_pairs = struct_predict_pairs
         self.struct_predict_seq = struct_predict_seq
         self.use_seq = use_seq
+        self.struct_seq_use_gumbel = struct_seq_use_gumbel
+        self.struct_seq_gumbel_tau = struct_seq_gumbel_tau
 
         self.features = ProteinFeatures(node_features, edge_features, top_k=k_neighbors, augment_eps=augment_eps, augment_type=augment_type, feat_type=feat_type, augment_lim=augment_lim)
         self.W_e = nn.Linear(edge_features, hidden_dim, bias=True)
@@ -1892,11 +1894,14 @@ class ProteinMPNN(nn.Module):
             else:
                 struct_etab = torch.zeros((b, n, n, h, h)).to(torch.float32)
             if self.struct_predict_seq:
-                h_V_fold = logits
+                if self.struct_seq_use_gumbel:
+                    h_V_fold = F.gumbel_softmax(logits, tau=self.struct_seq_gumbel_tau, hard=True, dim=-1)
+                else:
+                    h_V_fold = logits
             else:
                 h_V_fold = torch.zeros_like(logits)
             if self.use_struct_weights:
-                h_V_fold = self.node_struct_reshape(logits)
+                h_V_fold = self.node_struct_reshape(h_V_fold)
                 struct_etab = self.edge_struct_reshape(struct_etab)
             h_V_fold = h_V_fold.to(torch.float32)
             structure = self.struct_module(h_V_fold, struct_etab, 7*torch.ones(mask.shape, dtype=torch.long, device=etab.device), residue_idx.to(torch.long), mask)

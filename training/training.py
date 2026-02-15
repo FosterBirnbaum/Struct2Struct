@@ -409,6 +409,8 @@ def main(args):
                         multimer_structure_module=args.multimer_structure_module,
                         struct_predict_pairs=args.struct_predict_pairs,
                         struct_predict_seq=args.struct_predict_seq,
+                        struct_seq_use_gumbel=(args.struct_predict_seq and args.esmc_contrastive_weight > 0.0),
+                        struct_seq_gumbel_tau=args.esmc_gumbel_tau,
                         use_seq=args.use_seq,
                         vocab=vocab,
                         num_letters=vocab,
