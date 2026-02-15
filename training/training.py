@@ -162,15 +162,12 @@ def load_esmc_cache(embeddings_dir, lengths_json):
         if not os.path.exists(npz_path):
             continue
         data = np.load(npz_path)
-        msa = _extract_npz_array(data, ['msa', 'msa_embeddings', 'arr_0'], fallback_index=0)
-        rnd = _extract_npz_array(data, ['random', 'rand', 'random_embeddings', 'arr_1'], fallback_index=1)
-        if msa is None or rnd is None:
+        msa = _extract_npz_array(data, ['msa_embeddings', 'msa', 'arr_0'], fallback_index=0)
+        if msa is None:
             continue
         if msa.ndim == 3:
             msa = msa.mean(axis=1)
-        if rnd.ndim == 3:
-            rnd = rnd.mean(axis=1)
-        cache[prot] = {'msa': msa.astype(np.float32), 'random': rnd.astype(np.float32)}
+        cache[prot] = {'msa': msa.astype(np.float32)}
     return cache, length_to_proteins
 def load_pickle_stream(path):
     with open(path, "rb") as f:
